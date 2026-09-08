@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Show a live camera preview in the HuxerUI Camera example.</string>
+  <key>CFBundleDisplayName</key>
+  <string>Camera Preview</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.huxerui.lib.camera.preview</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleName</key>
+  <string>Camera Preview</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+</dict>
+</plist>

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Camera Preview
+Exec=example_camera
+Icon=example_camera
+Categories=Utility;
+Terminal=false

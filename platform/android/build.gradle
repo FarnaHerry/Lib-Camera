@@ -1,0 +1,29 @@
+plugins {
+    id "com.android.library"
+}
+
+dependencies {
+    if (rootProject.findProject(":HuxerUI") != null) {
+        compileOnly project(":HuxerUI")
+    } else {
+        def sdkHome = providers.environmentVariable("HUXERUI_HOME").get()
+        compileOnly files("${sdkHome}/share/huxerui/platform/android/HuxerUI.aar")
+    }
+    implementation "androidx.camera:camera-camera2:1.5.3"
+    implementation "androidx.camera:camera-lifecycle:1.5.3"
+}
+
+android {
+    namespace = "org.huxerui.lib.camera"
+    compileSdk = 36
+
+    defaultConfig {
+        minSdk = 23
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+}

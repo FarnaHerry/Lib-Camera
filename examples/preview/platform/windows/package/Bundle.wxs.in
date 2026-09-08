@@ -1,0 +1,17 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Bundle Name="Camera Preview" Manufacturer="org.huxerui.lib.camera.preview" Version="@HUXERUI_WINDOWS_PROJECT_VERSION@"
+          UpgradeCode="@HUXERUI_WINDOWS_BUNDLE_UPGRADE_CODE@"
+          IconSourceFile="!(bindpath.Project)\app.ico">
+    <BootstrapperApplication SourceFile="!(bindpath.Installer)\example_camera-Installer.exe">
+      <PayloadGroupRef Id="HuxerUIInstallerPayloads" />
+    </BootstrapperApplication>
+    <Variable Name="InstallFolder" Type="formatted" Value="[ProgramFiles64Folder]Camera Preview" />
+    <Variable Name="CreateDesktopShortcut" Type="numeric" Value="0" />
+    <Chain>
+      <MsiPackage SourceFile="!(bindpath.Package)\example_camera.msi">
+        <MsiProperty Name="INSTALLFOLDER" Value="[InstallFolder]" />
+        <MsiProperty Name="CREATE_DESKTOP_SHORTCUT" Value="[CreateDesktopShortcut]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

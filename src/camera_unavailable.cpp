@@ -1,0 +1,32 @@
+#include "camera_internal.h"
+
+#if !defined(__ANDROID__) && !defined(__APPLE__)
+namespace huxerui::camera::detail {
+namespace {
+
+class UnavailableCamera final : public CameraBackend {
+public:
+  void Start(std::optional<Facing>, std::function<void(CameraStatus)> changed) override {
+    changed({.state = SessionState::Failed,
+             .error = CameraError{CameraErrorCode::Unavailable, "Camera capture is not implemented on this platform."}});
+  }
+
+  void Stop(std::function<void()> completed) override {
+    if (completed) {
+      completed();
+    }
+  }
+};
+
+} // namespace
+
+void InstallPlatformCamera(RootContext& root) {
+  root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
+      camera_module_name, [](PlatformAdapter&) -> std::shared_ptr<CameraBackend> {
+        return std::make_shared<UnavailableCamera>();
+      }
+  );
+}
+
+} // namespace huxerui::camera::detail
+#endif
