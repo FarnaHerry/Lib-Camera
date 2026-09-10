@@ -1,6 +1,6 @@
 #include "camera_internal.h"
 
-#if !defined(__ANDROID__) && !defined(__APPLE__)
+#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(_WIN32)
 namespace huxerui::camera::detail {
 namespace {
 

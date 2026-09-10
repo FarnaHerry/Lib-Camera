@@ -1,10 +1,10 @@
 # HuxerUI Camera
 
-Camera preview and JPEG photo capture for HuxerUI applications on Android, iOS, and macOS.
+Camera preview and JPEG photo capture for HuxerUI applications on Android, iOS, macOS, and Windows.
 
 Use `UseCamera` to control a camera session, `CameraPreview` to display it, and `CapturePhotoAsync` to take photos. Multiple previews can share one session with independent fitting and mirroring. Preview frames update without recomposing the UI on every frame.
 
-Windows, Linux, and Web capture are not supported; capture requests report `CameraErrorCode::Unavailable`.
+Linux and Web capture are not supported; capture requests report `CameraErrorCode::Unavailable`.
 
 ## Installation
 
@@ -43,6 +43,7 @@ The application owns camera authorization. Use `ApplicationHandle::CheckPermissi
 
 - **Android:** the library declares the camera permission and optional camera hardware features. Your application must still request runtime permission.
 - **iOS and macOS:** add `NSCameraUsageDescription` to the application's Info.plist with a description of how the camera is used.
+- **Windows:** allow camera access for desktop applications in Windows privacy settings. Packaged applications also need the `webcam` capability in their package manifest.
 
 This component assumes the caller has obtained permission before setting `active` to true:
 
@@ -161,8 +162,16 @@ huxerui build android --profile debug
 huxerui run android --profile debug
 ```
 
-Replace `android` with `ios` or `macos` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera usage descriptions.
+Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use `--java-home /path/to/jdk17` if your default Java installation is unsuitable. Running on an iOS device requires your own signing configuration. The example already includes the Apple camera usage descriptions.
 
 Select **Start camera** to authorize and start the preview, then **Take photo** to capture. The photo icon opens the latest photo and its **Save photo** action. Use the adjacent controls to stop capture, switch cameras, or open preview settings. A failed session offers **Try again**.
+
+On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the native photo output and WIC to normalize orientation and JPEG quality.
+
+## Tests
+
+Configure with `-DHUXERUI_CAMERA_BUILD_TESTS=ON` and run `ctest --test-dir <build-directory> --output-on-failure`. On Windows, this includes JPEG corner checks for all stream rotations, all eight EXIF orientations, and final mirroring without opening a camera.
+
+Run `<build-directory>/camera_windows_tests.exe --device` explicitly to check live preview, photos, facing selection, stopping during pending operations, and restart. A camera and camera access are required. The Windows backend was tested with an ACER HD User Facing camera at 1280×720, and the example was manually verified. Device removal, permission revocation during capture, and sustained performance remain unverified.
 
 See the [public API reference](include/huxerui/camera.h) for complete options and contracts, or the [design document](docs/camera-design.md) for implementation details.

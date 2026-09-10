@@ -81,6 +81,11 @@ target_include_directories(huxerui_camera PUBLIC
 
 target_include_directories(huxerui_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+if (WIN32)
+    target_compile_definitions(huxerui_camera PRIVATE NOMINMAX UNICODE _UNICODE)
+    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 windowscodecs runtimeobject ole32 oleaut32)
+endif ()
+
 if (APPLE)
     target_compile_options(huxerui_camera PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
     target_link_libraries(huxerui_camera PRIVATE "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
@@ -98,4 +103,12 @@ if (HUXERUI_CAMERA_BUILD_TESTS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     target_link_libraries(camera_tests PRIVATE HuxerUI::Camera HuxerUI::huxerui_static)
     huxerui_enable_codegen(camera_tests)
     add_test(NAME camera_tests COMMAND camera_tests)
+    if (WIN32)
+        add_executable(camera_windows_tests tests/windows_camera_tests.cpp)
+        target_compile_features(camera_windows_tests PRIVATE cxx_std_20)
+        target_compile_definitions(camera_windows_tests PRIVATE NOMINMAX UNICODE _UNICODE)
+        target_include_directories(camera_windows_tests PRIVATE src platform/windows/src tests)
+        target_link_libraries(camera_windows_tests PRIVATE HuxerUI::Camera HuxerUI::huxerui_static)
+        add_test(NAME camera_windows_tests COMMAND camera_windows_tests)
+    endif ()
 endif ()

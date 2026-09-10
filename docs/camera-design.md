@@ -1,6 +1,6 @@
 # HuxerUI Camera Module Design
 
-Status: the shared API, session ownership, preview drawing, Android capture, and independent macOS/iOS AVFoundation backends are implemented. Android preview, geometry, switching, and background recovery were confirmed on TAS_AN00 after updating the installed SDK. iOS device and Simulator targets build with the corrected SDK dependency exports, and the Simulator example launches; the user also confirmed successful physical iOS device testing after the SDK link fix. See README.md for build limitations and verified implementation status.
+Status: the shared API, session ownership, preview drawing, Android capture, independent macOS/iOS AVFoundation backends, and Windows Media Foundation capture are implemented. Android preview, geometry, switching, and background recovery were confirmed on TAS_AN00 after updating the installed SDK. iOS device and Simulator targets build with the corrected SDK dependency exports, and the Simulator example launches; the user also confirmed successful physical iOS device testing after the SDK link fix. Windows preview and JPEG capture were verified at 1280×720 with an ACER HD User Facing camera, and the user confirmed the example works. See README.md for build limitations and verified implementation status.
 
 ## Design Decision
 
@@ -295,15 +295,26 @@ AVFoundation session interruption temporarily reports Suspended while preserving
 
 Camera declares its AVFoundation, CoreMedia, CoreVideo, and UIKit dependencies through its Swift Package. HuxerUI owns its application-level UserNotifications dependency, which is now included in the SDK export template and the installed package. Consumers receive it through the SDK CMake target.
 
+### Windows
+
+The backend uses Media Foundation Capture Engine with video-only device initialization. A private serial queue runs start, photo, and stop operations on Windows thread-pool workers initialized for COM MTA. Native event waits stay off the UI thread. Queue ownership retains capture resources through asynchronous cleanup; an explicit stop also satisfies backend destruction, avoiding duplicate stop scheduling.
+
+The preview sink negotiates RGB32 output. Positive-stride samples upload directly from the locked media buffer to a BGRA D3D11 texture; negative-stride samples use a reusable buffer to reverse row order. Publication through the SDK's `windows::D3D11Texture` produces render snapshots without per-frame UI state changes. This path includes CPU-to-GPU upload and SDK snapshot copying; it does not promise zero-copy capture. Sample publication and texture Finish share a lock.
+
+Default selection uses the first enumerated video device. Explicit facing matches Windows device enclosure metadata; unknown or opposite-facing devices are not substitutes. Preview rotation uses the selected stream's rotation metadata. The backend does not track changes from a device orientation sensor during capture.
+
+Still capture uses the engine's preferred photo source and an in-memory JPEG sink, without requiring a separate physical photo stream. WIC normalizes EXIF orientation, falling back to stream rotation when EXIF orientation is absent, then applies final mirroring and JPEG quality. Stop is serialized after accepted photo work. A native photo timeout fails the session and shuts down the engine before another request can reuse it.
+
+Automated image tests check all four corners for four stream rotations, all eight EXIF orientations, EXIF precedence, and final mirroring. Optional device tests cover frame publication, JPEG capture, pending-operation stops, strict facing selection, and restart. Device removal, permission revocation during capture, multiple GPU adapters, and sustained performance still require separate validation.
+
 ### Other Platforms
 
 | Platform | Future integration direction | Separate validation required |
 | --- | --- | --- |
-| Windows | Connect system video capture to `D3D11Texture`; evaluate `PixelTexture` when usable GPU input is unavailable | Format conversion, adapter consistency, device removal, compatibility builds |
 | Linux | Choose `GdkTexture`, `GlTexture`, or `PixelTexture` according to capture output | Actual capture API, DMA-BUF synchronization, drivers, destruction thread |
 | Web | Adapt captured frames to VideoFrame and publish through `VideoFrameTexture` | Browser support, the relationship between permission requests and media acquisition, main-thread constraints |
 
-These are future directions rather than initial platform commitments. Implement macOS and Android first, followed by iOS. Other platforms may retain buildable implementations that report Unavailable.
+Linux and Web remain future directions, with buildable implementations that report Unavailable.
 
 Web authorization may be tied to acquiring a media stream. Do not assume an independent CheckPermission call resolves that relationship. Verify the SDK permission contract against actual browser behavior before implementing Web support. At this stage, do not add a second permission API or a hidden DOM preview backend.
 
@@ -359,6 +370,9 @@ platform/android/src/main/java/org/huxerui/lib/camera/...
 platform/macos/src/...
 platform/ios/src/camera.mm
 platform/ios/Package.swift
+platform/windows/src/camera.cpp
+platform/windows/src/camera_photo.cpp
+platform/windows/src/camera_windows.h
 examples/preview/src/app.cpp
 ```
 
@@ -374,7 +388,7 @@ Start on macOS with an authorized Session lifecycle, pixel buffer publication, a
 
 Then validate Surface requests and release, all four orientations, front-camera mirroring, and source cropping on Android. Use those results to establish whether PreviewOutput geometry covers actual output. Do not freeze the public geometry interface before Android validation is complete.
 
-The independent iOS integration is complete. JPEG photo capture is implemented on Android, iOS, and macOS; complete physical-device acceptance for this new path before expanding to recording, analysis, or additional platforms.
+The independent iOS integration is complete. JPEG photo capture is implemented on Android, iOS, macOS, and Windows; complete physical-device acceptance for this path before expanding to recording, analysis, or additional platforms.
 
 ### Required Validation
 
