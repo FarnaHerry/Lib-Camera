@@ -2,6 +2,9 @@ package org.huxerui.lib.camera;
 
 import android.content.Context;
 import android.graphics.Rect;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
@@ -15,6 +18,9 @@ import androidx.camera.core.CameraInfo;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.CameraState;
 import androidx.camera.core.Preview;
+import androidx.camera.core.ImageCapture;
+import androidx.camera.core.ImageCaptureException;
+import androidx.camera.core.ImageProxy;
 import androidx.camera.core.SurfaceRequest;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.lifecycle.Lifecycle;
@@ -28,12 +34,16 @@ import org.huxerui.HuxerUIPlatformChannel;
 import org.huxerui.HuxerUIPlatformModule;
 import org.huxerui.PlatformPayload;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public final class CameraModule implements HuxerUIPlatformModule.Factory {
     @Override
@@ -58,6 +68,9 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private final ArrayList<HuxerUIPlatformChannel.Result> stops = new ArrayList<>();
         private ProcessCameraProvider provider;
         private Preview preview;
+        private ImageCapture photoOutput;
+        private final ExecutorService photoExecutor = Executors.newSingleThreadExecutor();
+        private boolean photoPending;
         private Camera camera;
         private Observer<CameraState> cameraObserver;
         private Output current;
@@ -85,7 +98,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             if (disposed) {
                 result.fail("camera/closed", "The camera session is closed.", PlatformPayload.nullValue());
             } else if (method.equals("start")) {
-                if (active || !outputs.isEmpty()) {
+                if (active || photoPending || !outputs.isEmpty()) {
                     result.fail("camera/busy", "The previous camera output is still stopping.", PlatformPayload.nullValue());
                     return null;
                 }
@@ -93,6 +106,8 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 PlatformPayload requested = arguments.requireField("facing");
                 start(requested.isNull() ? null : requested.requireString());
                 result.complete(PlatformPayload.nullValue());
+            } else if (method.equals("capturePhoto")) {
+                capturePhoto(arguments, result);
             } else if (method.equals("stop")) {
                 stops.add(result);
                 stop();
@@ -158,7 +173,15 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 });
                 request.setTransformationInfoListener(executor, output::configure);
             });
-            camera = provider.bindToLifecycle(this, selected.getCameraSelector(), preview);
+            photoOutput = new ImageCapture.Builder().setJpegQuality(100)
+                    .setTargetRotation(displayRotation()).build();
+            try {
+                camera = provider.bindToLifecycle(this, selected.getCameraSelector(), preview, photoOutput);
+            } catch (IllegalArgumentException unsupported) {
+                provider.unbind(preview, photoOutput);
+                photoOutput = null;
+                camera = provider.bindToLifecycle(this, selected.getCameraSelector(), preview);
+            }
             cameraObserver = state -> {
                 if (!active || token != generation) return;
                 CameraState.StateError error = state.getError();
@@ -183,6 +206,79 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME);
         }
 
+        private void capturePhoto(PlatformPayload arguments, HuxerUIPlatformChannel.Result result) {
+            if (!active || !opened || arguments.requireField("run").requireInt64() != run) {
+                result.fail("not-ready", "Start the camera before taking a photo.", PlatformPayload.nullValue());
+                return;
+            }
+            if (photoPending) {
+                result.fail("operation-in-progress", "A photo is still being processed.", PlatformPayload.nullValue());
+                return;
+            }
+            if (photoOutput == null) {
+                result.fail("unavailable", "This camera cannot combine preview and still photos.", PlatformPayload.nullValue());
+                return;
+            }
+            int quality = (int) arguments.requireField("quality").requireInt64();
+            boolean mirror = arguments.requireField("mirror").requireBoolean();
+            long token = generation;
+            photoPending = true;
+            try {
+                photoOutput.setTargetRotation(displayRotation());
+                photoOutput.takePicture(photoExecutor, new ImageCapture.OnImageCapturedCallback() {
+                    @Override public void onCaptureSuccess(@NonNull ImageProxy image) {
+                        byte[] encoded = null;
+                        String failure = null;
+                        Bitmap source = null;
+                        Bitmap upright = null;
+                        try {
+                            ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                            byte[] jpeg = new byte[buffer.remaining()];
+                            buffer.get(jpeg);
+                            source = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
+                            if (source == null) throw new IllegalStateException("Cannot decode the captured JPEG.");
+                            Matrix transform = new Matrix();
+                            transform.postRotate(image.getImageInfo().getRotationDegrees());
+                            if (mirror) transform.postScale(-1, 1);
+                            upright = Bitmap.createBitmap(source, 0, 0, source.getWidth(), source.getHeight(), transform, true);
+                            ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                            if (!upright.compress(Bitmap.CompressFormat.JPEG, quality, stream)) {
+                                throw new IllegalStateException("Cannot encode the captured JPEG.");
+                            }
+                            encoded = stream.toByteArray();
+                        } catch (Exception | OutOfMemoryError error) {
+                            failure = error.toString();
+                        } finally {
+                            image.close();
+                            if (upright != null && upright != source) upright.recycle();
+                            if (source != null) source.recycle();
+                        }
+                        finishPhoto(token, result, encoded, failure);
+                    }
+
+                    @Override public void onError(@NonNull ImageCaptureException error) {
+                        finishPhoto(token, result, null, error.toString());
+                    }
+                });
+            } catch (RuntimeException error) {
+                finishPhoto(token, result, null, error.toString());
+            }
+        }
+
+        private void finishPhoto(long token, HuxerUIPlatformChannel.Result result, byte[] jpeg, String failure) {
+            main.post(() -> {
+                photoPending = false;
+                if (!active || token != generation) {
+                    result.fail("interrupted", "Photo capture was interrupted.", PlatformPayload.nullValue());
+                } else if (failure != null) {
+                    result.fail("capture-failed", failure, PlatformPayload.nullValue());
+                } else {
+                    result.complete(PlatformPayload.bytes(jpeg));
+                }
+                completeStops();
+            });
+        }
+
         private void stop() {
             active = false;
             opened = false;
@@ -200,6 +296,10 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
                 provider.unbind(preview);
                 preview = null;
             }
+            if (photoOutput != null) {
+                provider.unbind(photoOutput);
+                photoOutput = null;
+            }
             for (Output output : new ArrayList<>(outputs)) {
                 if (output.texture == null) {
                     output.request.willNotProvideSurface();
@@ -210,10 +310,13 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         }
 
         private void completeStops() {
-            if (active || !outputs.isEmpty()) return;
+            if (active || photoPending || !outputs.isEmpty()) return;
             for (HuxerUIPlatformChannel.Result result : stops) result.complete(PlatformPayload.nullValue());
             stops.clear();
-            if (disposed) lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY);
+            if (disposed) {
+                lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY);
+                photoExecutor.shutdown();
+            }
         }
 
         @Override

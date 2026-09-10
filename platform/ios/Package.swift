@@ -20,6 +20,8 @@ let package = Package(
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
+                .linkedFramework("CoreImage"),
+                .linkedFramework("ImageIO"),
                 .linkedFramework("UIKit"),
             ]
         ),

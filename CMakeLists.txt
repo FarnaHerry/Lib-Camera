@@ -83,7 +83,8 @@ target_include_directories(huxerui_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/s
 
 if (APPLE)
     target_compile_options(huxerui_camera PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-    target_link_libraries(huxerui_camera PRIVATE "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo")
+    target_link_libraries(huxerui_camera PRIVATE "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
+        "-framework CoreImage" "-framework ImageIO")
 endif ()
 
 add_library(HuxerUI::Camera ALIAS huxerui_camera)
@@ -93,7 +94,7 @@ if (HUXERUI_CAMERA_BUILD_TESTS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     enable_testing()
     add_executable(camera_tests tests/camera_tests.cpp)
     target_compile_features(camera_tests PRIVATE cxx_std_20)
-    target_include_directories(camera_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(camera_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     target_link_libraries(camera_tests PRIVATE HuxerUI::Camera HuxerUI::huxerui_static)
     huxerui_enable_codegen(camera_tests)
     add_test(NAME camera_tests COMMAND camera_tests)

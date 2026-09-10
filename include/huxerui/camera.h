@@ -6,7 +6,10 @@
 #include <string>
 
 #include <huxerui/external_texture.h>
+#include <huxerui/data.h>
+#include <huxerui/resource.h>
 #include <huxerui/root.h>
+#include <huxerui/task.h>
 #include <huxerui/view.h>
 
 namespace huxerui::camera {
@@ -20,7 +23,7 @@ enum class Facing {
   Back,
 };
 
-/// Selects the final horizontal mirror appearance of an upright preview.
+/// Selects the final horizontal mirror appearance of an upright preview or photo.
 /// CameraPreview accounts for PreviewOutput::mirrored to avoid applying mirroring twice.
 enum class MirrorMode {
   /// Mirror a confirmed Facing::Front camera; leave rear or unknown-facing cameras unmirrored.
@@ -79,11 +82,17 @@ enum class CameraErrorCode {
   DeviceDisconnected,
   /// The requested capture input, output, format, or preview geometry could not be configured.
   ConfigurationFailed,
-  /// Capture failed to start, resume, or continue for another reason.
+  /// Capture failed to start, resume, continue, or produce a photo for another reason.
   CaptureFailed,
+  /// The session is not running and ready to accept a photo request.
+  NotReady,
+  /// Another photo request is still being captured or processed by this session.
+  OperationInProgress,
+  /// An accepted request was interrupted by stopping, switching, backgrounding, or session failure.
+  Interrupted,
 };
 
-/// Diagnostic information for a failed camera session.
+/// Diagnostic information for a failed camera session or individual operation.
 struct CameraError {
   /// Stable category suitable for application recovery decisions.
   CameraErrorCode code;
@@ -92,6 +101,22 @@ struct CameraError {
   std::string message;
 
   bool operator==(const CameraError&) const = default;
+};
+
+/// Success value or a camera operation error.
+/// @tparam T Owned result payload, or void for operations without a payload.
+/// Check Succeeded() before accessing Value() or Error().
+template <class T> using CameraResult = Result<T, CameraError>;
+
+/// Encoding and final appearance of one still photo, independent of preview settings.
+struct PhotoOptions {
+  /// Final JPEG encoding quality in [1, 100]; higher values generally produce larger files.
+  int jpeg_quality = 90;
+  /// Final horizontal mirroring after orientation is applied; Off by default.
+  /// Auto mirrors only a confirmed front camera. Preview fitting and mirroring do not affect this choice.
+  MirrorMode mirror = MirrorMode::Off;
+
+  bool operator==(const PhotoOptions&) const = default;
 };
 
 /// Declarative capture intent applied by UseCamera on recomposition.
@@ -156,6 +181,9 @@ struct CameraStatus {
   /// Available texture and presentation geometry, or empty before output is available or after it is cleared.
   /// A suspended platform session may retain output; its presence alone does not indicate live capture.
   std::optional<PreviewOutput> preview;
+  /// Whether an accepted photo request is still pending, including native processing after caller cancellation.
+  /// Capture normally remains Running during a photo; this flag is shared by all session handles.
+  bool capturing_photo = false;
 
   bool operator==(const CameraStatus&) const = default;
 };
@@ -187,6 +215,29 @@ public:
   ///     .With(Enabled(status.state == camera::SessionState::Failed));
   /// @endcode
   void Retry() const;
+
+  /// Captures a JPEG photo through the native still-photo output of the current camera.
+  /// Start from a UI event or Task, not during composition. The lazy task checks readiness when it runs.
+  /// Only one request is accepted at a time; additional requests return OperationInProgress without queuing.
+  /// The target orientation and resolved mirror mode are fixed when the request is accepted.
+  /// Success returns an independent ImageAsset with upright pixels, normal EXIF orientation, and scale 1.
+  /// Photo dimensions are negotiated by the native output, independently of the preview's layout or Cover crop.
+  /// Stopping, switching, backgrounding, or session failure ends a pending request with Interrupted.
+  /// An individual photo error does not set CameraStatus::error or stop otherwise healthy preview capture.
+  /// Task cancellation suppresses delivery; native cleanup continues before another request is accepted.
+  /// No file or photo-library entry is created. Save EncodedBytes() with the SDK File APIs when needed.
+  /// @param options JPEG quality and final mirroring for this request only.
+  /// @return A task yielding an owned JPEG image or CameraError; unavailable still-photo output returns Unavailable.
+  /// @throws std::invalid_argument Before returning a task if quality or mirror mode is invalid.
+  /// @code
+  /// auto result = co_await session.CapturePhotoAsync({.jpeg_quality = 90});
+  /// if (result.Succeeded()) {
+  ///   photo = result.Value();
+  /// } else {
+  ///   message = result.Error().message;
+  /// }
+  /// @endcode
+  [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 
 private:
   explicit CameraSession(std::shared_ptr<detail::CameraSessionData> data);

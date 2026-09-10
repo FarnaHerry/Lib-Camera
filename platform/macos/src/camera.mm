@@ -1,4 +1,9 @@
 #import <AVFoundation/AVFoundation.h>
+#import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
+
+#include <vector>
+#include <utility>
 
 #include <huxerui/macos/external_texture.h>
 
@@ -7,10 +12,122 @@
 using namespace huxerui;
 using namespace huxerui::camera;
 
+namespace {
+
+CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIContext* context) {
+  @autoreleasepool {
+    CIImage* image = [CIImage imageWithData:data options:@{kCIImageApplyOrientationProperty : @YES}];
+    if (!image || CGRectIsEmpty(image.extent) || CGRectIsInfinite(image.extent)) {
+      return CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Cannot decode the captured photo."});
+    }
+    if (options.mirror == MirrorMode::On) {
+      image = [image imageByApplyingTransform:CGAffineTransformMakeScale(-1, 1)];
+    }
+    image = [image
+        imageByApplyingTransform:CGAffineTransformMakeTranslation(-image.extent.origin.x, -image.extent.origin.y)];
+    CGImageRef pixels = [context createCGImage:image fromRect:image.extent];
+    if (!pixels)
+      return CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::CaptureFailed, "Cannot normalize the captured photo."});
+    NSMutableData* jpeg = [NSMutableData new];
+    CGImageDestinationRef destination =
+        CGImageDestinationCreateWithData((__bridge CFMutableDataRef)jpeg, CFSTR("public.jpeg"), 1, nullptr);
+    bool encoded = false;
+    if (destination) {
+      NSDictionary* properties = @{
+        (id)kCGImageDestinationLossyCompressionQuality : @(options.jpeg_quality / 100.0),
+        (id)kCGImagePropertyOrientation : @1
+      };
+      CGImageDestinationAddImage(destination, pixels, (__bridge CFDictionaryRef)properties);
+      encoded = CGImageDestinationFinalize(destination);
+      CFRelease(destination);
+    }
+    CGImageRelease(pixels);
+    if (!encoded)
+      return CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Cannot encode the captured JPEG."});
+    const auto* begin = static_cast<const std::byte*>(jpeg.bytes);
+    return CameraResult<ImageAsset>::Success(ImageAsset::FromEncoded(Bytes(begin, begin + jpeg.length)));
+  }
+}
+
+} // namespace
+
+@interface HUXMacPhotoCapture : NSObject <AVCapturePhotoCaptureDelegate> {
+  NSData* data_;
+  NSError* processingError_;
+  PhotoOptions options_;
+  dispatch_queue_t processingQueue_;
+  CIContext* context_;
+  std::function<void(CameraResult<ImageAsset>)> completed_;
+}
+- (instancetype)initWithOptions:(PhotoOptions)options
+                          queue:(dispatch_queue_t)queue
+                        context:(CIContext*)context
+                      completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
+@end
+
+@implementation HUXMacPhotoCapture
+
+- (instancetype)initWithOptions:(PhotoOptions)options
+                          queue:(dispatch_queue_t)queue
+                        context:(CIContext*)context
+                      completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
+  self = [super init];
+  if (self) {
+    options_ = options;
+    processingQueue_ = queue;
+    context_ = context;
+    completed_ = std::move(completed);
+  }
+  return self;
+}
+
+- (void)captureOutput:(AVCapturePhotoOutput*)output
+    didFinishProcessingPhoto:(AVCapturePhoto*)photo
+                       error:(NSError*)error {
+  processingError_ = error;
+  data_ = error ? nil : photo.fileDataRepresentation;
+}
+
+- (void)captureOutput:(AVCapturePhotoOutput*)output
+    didFinishCaptureForResolvedSettings:(AVCaptureResolvedPhotoSettings*)settings
+                                  error:(NSError*)error {
+  NSError* failure = error ?: processingError_;
+  dispatch_async(processingQueue_, ^{
+    auto completed = std::exchange(completed_, {});
+    if (!completed)
+      return;
+    if (failure || !data_) {
+      completed(CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::CaptureFailed,
+           failure.localizedDescription.UTF8String ?: "The camera returned no photo data."}));
+      return;
+    }
+    try {
+      @try {
+        completed(EncodePhoto(data_, options_, context_));
+      } @catch (NSException* exception) {
+        completed(CameraResult<ImageAsset>::Failure(
+            {CameraErrorCode::CaptureFailed, exception.reason.UTF8String ?: "Photo encoding failed."}));
+      }
+    } catch (const std::exception& exception) {
+      completed(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, exception.what()}));
+    }
+  });
+}
+
+@end
+
 @interface HUXCameraCapture : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate> {
   dispatch_queue_t queue_;
   AVCaptureSession* session_;
   AVCaptureVideoDataOutput* output_;
+  AVCapturePhotoOutput* photoOutput_;
+  HUXMacPhotoCapture* photo_;
+  dispatch_queue_t photoQueue_;
+  CIContext* photoContext_;
+  std::vector<std::function<void()>> stops_;
+  std::uint64_t photoGeneration_;
   AVCaptureDevice* device_;
   NSMutableArray* observers_;
   std::shared_ptr<macos::PixelBufferTexture> texture_;
@@ -19,6 +136,7 @@ using namespace huxerui::camera;
 }
 - (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed;
 - (void)stop:(std::function<void()>)completed;
+- (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
 @end
 
 @implementation HUXCameraCapture
@@ -28,6 +146,7 @@ using namespace huxerui::camera;
   if (self) {
     queue_ = dispatch_queue_create("org.huxerui.camera.capture", DISPATCH_QUEUE_SERIAL);
     observers_ = [NSMutableArray new];
+    photoQueue_ = dispatch_queue_create("org.huxerui.camera.macos.photo", DISPATCH_QUEUE_SERIAL);
   }
   return self;
 }
@@ -100,6 +219,16 @@ using namespace huxerui::camera;
       connection.automaticallyAdjustsVideoMirroring = NO;
       connection.videoMirrored = NO;
     }
+    photoOutput_ = [AVCapturePhotoOutput new];
+    if ([session_ canAddOutput:photoOutput_]) {
+      [session_ addOutput:photoOutput_];
+      if (![photoOutput_.availablePhotoCodecTypes containsObject:AVVideoCodecTypeJPEG]) {
+        [session_ removeOutput:photoOutput_];
+        photoOutput_ = nil;
+      }
+    } else {
+      photoOutput_ = nil;
+    }
     [output_ setSampleBufferDelegate:self queue:queue_];
     [session_ commitConfiguration];
     __weak HUXCameraCapture* weak = self;
@@ -166,9 +295,65 @@ using namespace huxerui::camera;
   }
 }
 
+- (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!changed_ || !session_.isRunning) {
+      completed(
+          CameraResult<ImageAsset>::Failure({CameraErrorCode::NotReady, "Start the camera before taking a photo."}));
+      return;
+    }
+    if (photo_) {
+      completed(CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::OperationInProgress, "A photo is still being processed."}));
+      return;
+    }
+    if (!photoOutput_) {
+      completed(CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::Unavailable, "This camera cannot combine preview and still photos."}));
+      return;
+    }
+    AVCaptureConnection* connection = [photoOutput_ connectionWithMediaType:AVMediaTypeVideo];
+    if (connection.isVideoMirroringSupported) {
+      connection.automaticallyAdjustsVideoMirroring = NO;
+      connection.videoMirrored = NO;
+    }
+    const auto token = photoGeneration_;
+    auto finish = [self, token, completed](CameraResult<ImageAsset> result) {
+      dispatch_async(queue_, ^{
+        photo_ = nil;
+        if (!changed_ || token != photoGeneration_) {
+          completed(
+              CameraResult<ImageAsset>::Failure({CameraErrorCode::Interrupted, "Photo capture was interrupted."}));
+        } else {
+          completed(result);
+        }
+        [self completeStops];
+      });
+    };
+    if (!photoContext_) {
+      photoContext_ = [CIContext contextWithOptions:@{kCIContextCacheIntermediates : @NO}];
+    }
+    photo_ = [[HUXMacPhotoCapture alloc] initWithOptions:options
+                                                queue:photoQueue_
+                                              context:photoContext_
+                                            completed:finish];
+    @try {
+      AVCapturePhotoSettings* settings =
+          [AVCapturePhotoSettings photoSettingsWithFormat:@{AVVideoCodecKey : AVVideoCodecTypeJPEG}];
+      [photoOutput_ capturePhotoWithSettings:settings delegate:photo_];
+    } @catch (NSException* exception) {
+      finish(CameraResult<ImageAsset>::Failure(
+          {CameraErrorCode::CaptureFailed, exception.reason.UTF8String ?: "Cannot capture a photo."}));
+    }
+  });
+}
+
 - (void)stop:(std::function<void()>)completed {
   dispatch_async(queue_, ^{
     changed_ = {};
+    ++photoGeneration_;
+    if (completed)
+      stops_.push_back(completed);
     for (id observer in observers_) {
       [NSNotificationCenter.defaultCenter removeObserver:observer];
     }
@@ -176,16 +361,23 @@ using namespace huxerui::camera;
     [output_ setSampleBufferDelegate:nil queue:nullptr];
     [session_ stopRunning];
     output_ = nil;
-    session_ = nil;
     device_ = nil;
     if (texture_) {
       texture_->Finish();
       texture_.reset();
     }
-    if (completed) {
-      completed();
-    }
+    [self completeStops];
   });
+}
+
+- (void)completeStops {
+  if (changed_ || photo_)
+    return;
+  photoOutput_ = nil;
+  session_ = nil;
+  auto stops = std::exchange(stops_, {});
+  for (const auto& completed : stops)
+    completed();
 }
 
 @end
@@ -201,6 +393,9 @@ public:
   }
   void Stop(std::function<void()> completed) override {
     [capture_ stop:std::move(completed)];
+  }
+  void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
+    [capture_ capturePhoto:options completed:std::move(completed)];
   }
 
 private:

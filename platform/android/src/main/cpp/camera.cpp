@@ -13,6 +13,12 @@ CameraErrorCode DecodeError(std::string_view code) {
   if (code == "device-disconnected") return CameraErrorCode::DeviceDisconnected;
   if (code == "configuration-failed") return CameraErrorCode::ConfigurationFailed;
   if (code == "capture-failed") return CameraErrorCode::CaptureFailed;
+  if (code == "not-ready")
+    return CameraErrorCode::NotReady;
+  if (code == "operation-in-progress")
+    return CameraErrorCode::OperationInProgress;
+  if (code == "interrupted")
+    return CameraErrorCode::Interrupted;
   return CameraErrorCode::Unavailable;
 }
 
@@ -76,6 +82,25 @@ public:
     channel_.Invoke<std::monostate>("stop", [completed = std::move(completed)](PlatformResult<std::monostate>) {
       if (completed) completed();
     });
+  }
+
+  void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
+    PlatformPayload::Object arguments{
+        {"run", run_}, {"quality", options.jpeg_quality}, {"mirror", options.mirror == MirrorMode::On}};
+    channel_.Invoke(
+        "capturePhoto", PlatformPayload(std::move(arguments)),
+        [completed = std::move(completed)](PlatformResult<PlatformPayload> result) {
+          if (auto* error = std::get_if<PlatformError>(&result)) {
+            completed(CameraResult<ImageAsset>::Failure({DecodeError(error->code), error->message}));
+            return;
+          }
+          try {
+            const auto bytes = std::get<PlatformPayload>(result).AsBytes();
+            completed(CameraResult<ImageAsset>::Success(ImageAsset::FromEncoded(Bytes(bytes.begin(), bytes.end()))));
+          } catch (const std::exception& error) {
+            completed(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
+          }
+        });
   }
 
 private:

@@ -21,7 +21,7 @@ flowchart LR
     Status --> Session
 ```
 
-The initial version supports default, front, and back camera selection; asynchronous start and stop; preview; orientation and mirroring; foreground recovery; device errors; and resource cleanup. It excludes photo capture, recording, barcode scanning, beauty effects, raw frame subscriptions, manual exposure, concurrent cameras, and a device enumeration UI. Public interfaces for those features are not defined in advance.
+The initial version supports default, front, and back camera selection; asynchronous start and stop; preview; orientation and mirroring; foreground recovery; device errors; and resource cleanup. It also supports asynchronous JPEG still photos. It excludes recording, barcode scanning, beauty effects, raw frame subscriptions, manual exposure, concurrent cameras, and a device enumeration UI. Public interfaces for those features are not defined in advance.
 
 ## Verified SDK Constraints
 
@@ -72,11 +72,21 @@ enum class CameraErrorCode {
   DeviceDisconnected,
   ConfigurationFailed,
   CaptureFailed,
+  NotReady,
+  OperationInProgress,
+  Interrupted,
 };
 
 struct CameraError {
   CameraErrorCode code;
   std::string message;
+};
+
+template <class T> using CameraResult = Result<T, CameraError>;
+
+struct PhotoOptions {
+  int jpeg_quality = 90;
+  MirrorMode mirror = MirrorMode::Off;
 };
 
 struct CameraOptions {
@@ -103,12 +113,14 @@ struct CameraStatus {
   std::optional<Facing> actual_facing;
   std::optional<CameraError> error;
   std::optional<PreviewOutput> preview;
+  bool capturing_photo = false;
 };
 
 class CameraSession {
 public:
   [[nodiscard]] CameraStatus Status() const;
   void Retry() const;
+  [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 };
 
 void Install(RootContext& root);
@@ -161,6 +173,20 @@ View CameraContent(bool active) {
 
 Applications that need an error page or startup indicator read `session.Status()` and compose ordinary HuxerUI components. CameraPreview does not include text, authorization buttons, camera toolbars, or tap-to-focus behavior.
 
+## Still Photos and File Export
+
+`CapturePhotoAsync(PhotoOptions)` returns `Task<CameraResult<ImageAsset>>`. `CameraResult<T>` reuses the SDK Result implementation with CameraError; ImageAsset already owns the encoded image, format, and dimensions. No camera-specific photo container or file result type is needed.
+
+A session accepts one still request at a time without queuing. It stays Running while `capturing_photo` is true; canceling the caller suppresses result delivery without admitting another capture before native cleanup. Stop, switch, background, close, and reported session interruptions resolve accepted work as Interrupted. Ordinary photo errors stay local to that result and do not populate CameraStatus::error. Generation and request identity checks discard stale callbacks.
+
+The first format is JPEG, with quality 1–100 and scale 1. The native target orientation and resolved mirror mode are frozen on acceptance. Each backend normalizes pixel orientation, optionally mirrors the upright pixels, and emits a JPEG that requires no EXIF rotation. Photo mirroring defaults to Off. Auto mirrors confirmed front cameras. Preview layout, crop, fit, and mirror settings have no effect on still capture. Native output negotiates photo dimensions independently; maximum-resolution photography, HDR, RAW, metadata retention, and recording are outside this phase.
+
+Android binds ImageCapture with Preview and performs JPEG normalization on a separate executor. The iOS and macOS implementations remain separate; each owns AVCapturePhotoOutput, a per-request delegate retained through final capture, and a photo processing queue. Stop completion waits for both preview release and photo cleanup. Unsupported preview/photo output combinations fall back to preview where configuration APIs can detect the limitation.
+
+The current SDK has no public callback-to-Task completion primitive. The private request stores one completion behind a condition variable; RunWorker bridges that completion through the SDK's existing cancellation and UI-dispatch contract. Native callbacks never directly resume coroutine frames. At most one such wait belongs to a session, and interruption releases it independently of native cleanup.
+
+Saving is composed with the SDK File and FilePicker APIs. Write ImageAsset::EncodedBytes() to an application-owned file, or prepare a temporary file and pass it to FilePicker::SaveFileAsync() for user-directed export. CameraSession does not add a duplicate SavePhotoAsync wrapper, select paths, or create photo-library entries. The example supports capture, photo review, and file export. See README.md for complete English usage examples and validation scope.
+
 ## Ownership and Lifecycle
 
 | Object | Owner | End of lifetime |
@@ -211,7 +237,7 @@ Geometry describes the texture that HuxerUI actually samples. It must not simply
 
 CameraPreview computes its display transform in this order: valid-region crop, orientation correction, final mirroring policy, Fit, and centered placement. `MirrorMode::Auto` displays confirmed front cameras mirrored, and back cameras or devices with unknown facing without mirroring. On and Off specify the final mirrored state rather than applying an unconditional extra flip.
 
-The final mirror operation is `output.mirrored XOR desired_mirror`. Mirroring affects preview only and does not constrain future photo capture or analysis output.
+The final mirror operation is `output.mirrored XOR desired_mirror`. This mirror operation affects preview only; PhotoOptions independently controls still-photo mirroring.
 
 For cropped source dimensions `cw × ch`, a 90° or 270° rotation produces display dimensions `ch × cw`. Within a `vw × vh` destination, Contain uses `min(vw / sw, vh / sh)` and Cover uses `max(vw / sw, vh / sh)`, followed by centering and clipping to the destination. Other ImageFit values follow their corresponding semantics in the active SDK and must not silently map to Cover.
 
@@ -348,7 +374,7 @@ Start on macOS with an authorized Session lifecycle, pixel buffer publication, a
 
 Then validate Surface requests and release, all four orientations, front-camera mirroring, and source cropping on Android. Use those results to establish whether PreviewOutput geometry covers actual output. Do not freeze the public geometry interface before Android validation is complete.
 
-Integrate iOS next, completing authorization descriptions and recovery behavior. Discuss and design additional platforms, photo capture, recording, and analysis output separately.
+The independent iOS integration is complete. JPEG photo capture is implemented on Android, iOS, and macOS; complete physical-device acceptance for this new path before expanding to recording, analysis, or additional platforms.
 
 ### Required Validation
 

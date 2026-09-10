@@ -2,6 +2,14 @@
 #include <huxerui/camera.h>
 #include <app_resources.h>
 
+#if defined(__ANDROID__)
+#include <huxerui/android/platform_registry.h>
+#endif
+
+#include <atomic>
+#include <chrono>
+#include <mutex>
+
 using namespace huxerui;
 
 namespace {
@@ -153,6 +161,121 @@ View EmptyPreview(const camera::CameraStatus& status, bool authorizing, const st
   );
 }
 
+#if defined(__ANDROID__)
+class PhotoThumbnail {
+public:
+  explicit PhotoThumbnail(PlatformChannel channel) : channel_(std::move(channel)) {}
+  ~PhotoThumbnail() { channel_.Close(); }
+
+  std::function<void()> Load(ImageAsset photo, std::function<void(ImageAsset, std::string)> completed) {
+    const auto encoded = photo.EncodedBytes();
+    const auto request = channel_.Invoke<Bytes>(
+        "decode", Bytes(encoded.begin(), encoded.end()),
+        [completed = std::move(completed)](PlatformResult<Bytes> result) {
+          if (const auto* error = std::get_if<PlatformError>(&result)) {
+            completed({}, error->message);
+            return;
+          }
+          ImageAsset thumbnail;
+          try {
+            thumbnail = ImageAsset::FromEncoded(std::move(std::get<Bytes>(result)));
+          } catch (const std::exception& error) {
+            completed({}, error.what());
+            return;
+          }
+          completed(std::move(thumbnail), {});
+        });
+    return [channel = channel_, request] { (void)channel.Cancel(request); };
+  }
+
+private:
+  PlatformChannel channel_;
+};
+#endif
+
+#if defined(__ANDROID__)
+[[huxerui::composable]]
+View PhotoImage(ImageAsset photo) {
+  auto thumbnails = UseService<PhotoThumbnail>();
+  auto image = UseState(ImageAsset{});
+  auto error = UseState(std::string{});
+  Lifecycle([thumbnails, photo, image, error] {
+    image = ImageAsset{};
+    error = std::string{};
+    return thumbnails->Load(photo, [image, error](ImageAsset thumbnail, std::string failure) {
+      image = std::move(thumbnail);
+      error = std::move(failure);
+    });
+  }, photo);
+  if (!image.Get().HasValue()) {
+    return Column {
+      error.Get().empty() ? View(ProgressCircle()) : View(Label(error.Get(), 12.0F).Align(TextAlign::Center)),
+    }.With(MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center));
+  }
+  return Image(image.Get()).Fit(ImageFit::Contain);
+}
+#else
+View PhotoImage(ImageAsset photo) {
+  return Image(photo).Fit(ImageFit::Contain);
+}
+#endif
+
+[[huxerui::composable]]
+View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, State<bool> saving) {
+  auto files = UseService<FileSystem>();
+  auto picker = UseService<FilePicker>();
+  auto message = UseState(std::string{});
+  auto save = [tasks, files, picker, photo, saving, message] {
+    if (saving.Get()) return;
+    saving = true;
+    message = std::string{};
+    tasks.Launch([files, picker, photo, saving, message]() -> Task<void> {
+      static std::atomic_uint64_t sequence{0};
+      const auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+      const auto filename = "camera-" + std::to_string(timestamp) + "-" + std::to_string(++sequence) + ".jpg";
+      const File directory = files->Directories().temporary_directory.Child("camera-preview-exports");
+      const File temporary = directory.Child(filename);
+      try {
+        const bool prepared = co_await RunWorker([directory] {
+          static std::once_flag cleanup;
+          // Sweep previous runs only once so another window cannot delete an active export.
+          std::call_once(cleanup, [&] { (void)directory.DeleteRecursively(); });
+          return directory.CreateDirectories();
+        });
+        const auto encoded = photo.EncodedBytes();
+        if (prepared && co_await temporary.WriteBytesAsync(Bytes(encoded.begin(), encoded.end()))) {
+          SaveFileOptions options{
+              .suggested_name = "photo.jpg",
+              .filter = {.name = "JPEG image", .extensions = {"jpg"}, .content_types = {"image/jpeg"}},
+          };
+          const bool saved = co_await picker->SaveFileAsync(temporary, options);
+          message = std::string(saved ? "Photo saved." : "Photo was not saved.");
+        } else {
+          message = std::string("Could not prepare the photo for saving.");
+        }
+      } catch (const std::exception& error) {
+        message = std::string(error.what());
+      }
+      (void)co_await temporary.DeleteAsync();
+      saving = false;
+    });
+  };
+  return ScrollView(Column {
+    Row {
+      Label("Your photo", 20.0F, foreground, FontWeight::SemiBold),
+      Spacer(),
+      IconButton(app::images::close, "Close photo").OnClick([sheet] { sheet.Dismiss(); }),
+    }.With(CrossAlign(CrossAxisAlignment::Center)),
+    PhotoImage(photo)
+        .With(Frame{.height = 280.0F}, Background(Color::Black()), CornerRadius(16.0F), ClipChildren()),
+    Label(std::to_string(photo.PixelWidth()) + " × " + std::to_string(photo.PixelHeight()) + " · JPEG", 12.0F),
+    Button(saving.Get() ? "Saving photo" : "Save photo").OnClick(save)
+        .With(Enabled(!saving.Get() && picker->CanSaveFiles())),
+    Label(!picker->CanSaveFiles() ? "File export is unavailable on this device." : message.Get(), 12.0F),
+  }.With(Padding(20.0F), Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+      .With(Frame{.max_height = 560.0F});
+}
+
 [[huxerui::composable]]
 View CameraWorkspace() {
   auto active = UseState(false);
@@ -163,6 +286,9 @@ View CameraWorkspace() {
   auto comparison = UseState(false);
   auto authorizing = UseState(false);
   auto permission_error = UseState(std::string{});
+  auto photo = UseState(ImageAsset{});
+  auto photo_error = UseState(std::string{});
+  auto saving_photo = UseState(false);
   auto application = UseApplication();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
@@ -214,6 +340,27 @@ View CameraWorkspace() {
     });
   };
 
+  auto take_photo = [session, tasks, photo, photo_error] {
+    if (session.Status().capturing_photo) return;
+    photo_error = std::string{};
+    tasks.Launch([session, photo, photo_error]() -> Task<void> {
+      try {
+        auto result = co_await session.CapturePhotoAsync();
+        if (result.Succeeded()) photo = std::move(result).Value();
+        else photo_error = result.Error().message;
+      } catch (const std::exception& error) {
+        photo_error = std::string(error.what());
+      }
+    });
+  };
+  auto show_photo = [sheets, photo, tasks, saving_photo] {
+    const auto image = photo.Get();
+    if (!image.HasValue()) return;
+    sheets.Show([image, tasks, saving_photo](BottomSheetContext sheet) {
+      return PhotoReview(image, sheet, tasks, saving_photo);
+    });
+  };
+
   View viewfinder = Stack {
     camera::CameraPreview(session, {.fit = fit.Get(), .mirror = mirror.Get()}).Key("main-preview"),
     live ? View() : EmptyPreview(status, authorizing.Get(), permission_error.Get()),
@@ -252,7 +399,8 @@ View CameraWorkspace() {
         Label(fit.Get() == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
       }.With(Spacing(4.0F)),
       Spacer(),
-      Label("LIVE PREVIEW", 10.0F, secondary, FontWeight::Medium),
+      IconButton(app::images::photo, "View last photo").OnClick(show_photo)
+          .With(Enabled(photo.Get().HasValue()), Background(control_background), CornerRadius(14.0F)),
     }.With(CrossAlign(CrossAxisAlignment::Center)),
     Row {
       IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
@@ -260,12 +408,17 @@ View CameraWorkspace() {
         facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
       }).With(Enabled(!authorizing.Get() && !stopping), Background(control_background), CornerRadius(14.0F)),
       Button(authorizing.Get() ? "Requesting access" : stopping ? "Stopping camera"
+          : status.capturing_photo ? "Taking photo" : live ? "Take photo"
           : failed || !permission_error.Get().empty() ? "Try again"
           : active.Get() ? "Stop camera" : "Start camera")
-          .OnClick(toggle_camera).With(Grow(), Enabled(!authorizing.Get() && !stopping)),
+          .OnClick([live, take_photo, toggle_camera] { if (live) take_photo(); else toggle_camera(); })
+          .With(Grow(), Enabled(!authorizing.Get() && !stopping && !status.capturing_photo)),
+      live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
+          .With(Background(control_background), CornerRadius(14.0F))) : View(),
       expanded ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
           .With(Background(control_background), CornerRadius(14.0F))),
     }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
+    photo_error.Get().empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
   }.With(Spacing(18.0F), Padding(EdgeInsets::Symmetric(4.0F, 8.0F)), CrossAlign(CrossAxisAlignment::Stretch));
 
   View preview = Column {
@@ -368,6 +521,17 @@ const Application application{
         .show_debug_overlay = false,
         .root_hooks = {
             huxerui::camera::Install,
+#if defined(__ANDROID__)
+            [](RootContext& root) {
+              android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;
+              factory.class_name = "org.huxerui.lib.camera.preview.PhotoThumbnailModule";
+              factory.create = [](PlatformChannel channel) {
+                return std::make_shared<PhotoThumbnail>(std::move(channel));
+              };
+              root.RegisterPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail", std::move(factory));
+              root.Provide(root.OpenPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail"));
+            },
+#endif
         },
     }
 };

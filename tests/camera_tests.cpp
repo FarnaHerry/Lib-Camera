@@ -6,9 +6,13 @@
 #include <deque>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <stdexcept>
 
 #include "camera_internal.h"
+#include "camera_session.h"
+#include "photo_fixture.h"
 
 using namespace huxerui;
 using namespace huxerui::camera;
@@ -77,7 +81,11 @@ void TestGeometry() {
 
 class TestPlatform final : public PlatformAdapter {
 public:
-  TestPlatform() : PlatformAdapter([this](std::function<void()> work) { pending.push_back(std::move(work)); }) {}
+  TestPlatform()
+      : PlatformAdapter([this](std::function<void()> work) {
+          std::lock_guard lock(mutex);
+          pending.push_back(std::move(work));
+        }) {}
   void RequestFrameAt(double) override {}
   double Now() const noexcept override { return 0.0; }
   FontMetrics Metrics(const Font&) override { return {}; }
@@ -87,19 +95,39 @@ public:
   }
   void Drain(Runtime& runtime) {
     for (int turns = 0; turns < 30; ++turns) {
-      while (!pending.empty()) {
-        auto work = std::move(pending.front());
-        pending.pop_front();
-        work();
+      while (RunOne()) {
       }
       runtime.BuildFrame();
-      if (pending.empty()) {
+      std::lock_guard lock(mutex);
+      if (pending.empty())
         return;
-      }
     }
     throw std::runtime_error("UI dispatch did not settle.");
   }
 
+  bool RunOne() {
+    std::function<void()> work;
+    {
+      std::lock_guard lock(mutex);
+      if (pending.empty())
+        return false;
+      work = std::move(pending.front());
+      pending.pop_front();
+    }
+    work();
+    return true;
+  }
+
+  void Await(Runtime& runtime, const std::function<bool()>& done) {
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+      Drain(runtime);
+      std::this_thread::sleep_for(1ms);
+    }
+    Check(done(), "Asynchronous photo operation did not complete.");
+  }
+
+  std::mutex mutex;
   std::deque<std::function<void()>> pending;
 };
 
@@ -157,6 +185,15 @@ void TestSessionLifetime() {
     platform.Drain(runtime);
     Check(backends.size() == 1, "Two previews must share one backend.");
     Check(retained_session->Status().state == SessionState::Stopped, "Inactive session must start stopped.");
+    for (int quality : {0, 101}) {
+      bool rejected = false;
+      try {
+        (void)retained_session->CapturePhotoAsync({.jpeg_quality = quality});
+      } catch (const std::invalid_argument&) {
+        rejected = true;
+      }
+      Check(rejected, "Invalid JPEG quality must throw before a task is returned.");
+    }
     requested = CameraOptions{.active = true};
     runtime.BuildFrame();
     platform.Drain(runtime);
@@ -182,13 +219,221 @@ void TestSessionLifetime() {
   retained_session.reset();
 }
 
+class PhotoBackend final : public camera::detail::CameraBackend {
+public:
+  std::function<void(camera::CameraResult<ImageAsset>)> pending;
+  std::function<void()> stopped;
+  camera::PhotoOptions options;
+  int captures = 0;
+
+  void Start(std::optional<camera::Facing>, std::function<void(camera::CameraStatus)>) override {}
+  void Stop(std::function<void()> completed) override { stopped = std::move(completed); }
+  void CapturePhoto(camera::PhotoOptions value,
+                    std::function<void(camera::CameraResult<ImageAsset>)> completed) override {
+    ++captures;
+    options = value;
+    pending = std::move(completed);
+  }
+  void Complete(camera::CameraResult<ImageAsset> result) {
+    auto completed = std::exchange(pending, {});
+    completed(std::move(result));
+    if (auto stop = std::exchange(stopped, {}))
+      stop();
+  }
+};
+
+struct PhotoTestContext {
+  std::shared_ptr<camera::detail::CameraSessionData> owner;
+  std::shared_ptr<PhotoBackend> backend = std::make_shared<PhotoBackend>();
+  std::optional<TaskScope> callers;
+  State<bool> visible;
+  Facing facing = Facing::Front;
+};
+
+[[huxerui::composable]]
+View PhotoTestOwner(PhotoTestContext* context) {
+  auto status = UseState(CameraStatus{.state = SessionState::Running, .actual_facing = context->facing});
+  auto tasks = UseTaskScope();
+  auto retained = UseState(std::make_shared<camera::detail::CameraSessionData>(status, tasks, UseApplication()));
+  context->owner = retained.Get();
+  Lifecycle([owner = context->owner, backend = context->backend] {
+    owner->backend = backend;
+    owner->engaged = true;
+    return [owner] { owner->Close(); };
+  }, context->owner);
+  return Canvas([](PaintContext&, Size) {});
+}
+
+PhotoTestContext* active_photo_test = nullptr;
+
+[[huxerui::composable]]
+View PhotoTestContent(PhotoTestContext* context) {
+  context->callers = UseTaskScope();
+  context->visible = UseState(true);
+  return context->visible.Get() ? PhotoTestOwner(context) : View{};
+}
+
+View PhotoTestRoot() { return PhotoTestContent(active_photo_test); }
+
+class PhotoTestFixture {
+public:
+  PhotoTestContext context;
+  Application application;
+  TestPlatform platform;
+  Runtime runtime;
+
+  explicit PhotoTestFixture(Facing facing = Facing::Front)
+      : application(PhotoTestRoot, {.show_debug_overlay = false}),
+        runtime(application, platform) {
+    Check(!active_photo_test, "Photo fixtures must not overlap.");
+    active_photo_test = &context;
+    context.facing = facing;
+    runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
+    Drain();
+  }
+
+  ~PhotoTestFixture() { active_photo_test = nullptr; }
+
+  TaskHandle Launch(std::optional<CameraResult<ImageAsset>>& result, PhotoOptions options = {}) {
+    return context.callers->Launch([&result, options, owner = context.owner]() -> Task<void> {
+      result = co_await camera::detail::CapturePhoto(owner, options);
+    });
+  }
+
+  void Drain() { platform.Drain(runtime); }
+  void Await(const std::optional<CameraResult<ImageAsset>>& result) {
+    platform.Await(runtime, [&] { return result.has_value(); });
+  }
+};
+
+void TestPhotoRequests() {
+  {
+    PhotoTestFixture fixture;
+    const auto& owner = fixture.context.owner;
+    const auto& backend = fixture.context.backend;
+    std::optional<CameraResult<ImageAsset>> first;
+    std::optional<CameraResult<ImageAsset>> second;
+    auto handle = fixture.Launch(first, {.jpeg_quality = 82, .mirror = MirrorMode::Auto});
+    fixture.Drain();
+    Check(owner->status->capturing_photo, "Accepted photo must publish busy state.");
+    Check(backend->options.mirror == MirrorMode::On, "Auto photo mirror must lock actual front facing.");
+    Check(backend->options.jpeg_quality == 82, "Photo quality must reach the native backend.");
+    (void)fixture.Launch(second);
+    fixture.Await(second);
+    Check(second->Error().code == CameraErrorCode::OperationInProgress, "Concurrent photos must be rejected.");
+    Check(backend->captures == 1, "Rejected photo must not reach the backend.");
+    handle.Cancel();
+    fixture.Drain();
+    Check(owner->status->capturing_photo, "Canceling the caller must not release native capture ownership.");
+    backend->Complete(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Injected capture failure."}));
+    fixture.Drain();
+    Check(!first && !owner->status->capturing_photo, "Canceled caller must not receive a late callback.");
+    Check(owner->status->state == SessionState::Running && !owner->status->error,
+          "Single-photo errors must not fail the preview session.");
+  }
+  {
+    PhotoTestFixture fixture;
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result);
+    fixture.Drain();
+    fixture.context.backend->Complete(
+        CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Injected encoding failure."}));
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::CaptureFailed, "Photo error must reach its caller.");
+    Check(fixture.context.owner->status->state == SessionState::Running && !fixture.context.owner->status->error,
+          "An encoding failure must leave preview running.");
+  }
+  {
+    PhotoTestFixture fixture;
+    const auto& owner = fixture.context.owner;
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result);
+    fixture.Drain();
+    owner->Update({.active = false}, false);
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::Interrupted, "Stopping must interrupt the photo task.");
+    Check(owner->status->state == SessionState::Stopping, "Stop must wait for native photo cleanup.");
+    Check(owner->status->capturing_photo, "Native cleanup remains busy while stopping.");
+    fixture.context.backend->Complete(
+        CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Late native failure."}));
+    fixture.Drain();
+    Check(result->Error().code == CameraErrorCode::Interrupted, "Late callbacks must not replace interruption.");
+    Check(owner->status->state == SessionState::Stopped, "Native completion must settle stop.");
+    result.reset();
+    (void)fixture.Launch(result);
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::NotReady, "Stopped camera must reject photos.");
+  }
+  const ImageAsset image = PhotoFixture();
+  ImageAsset retained_photo;
+  {
+    PhotoTestFixture fixture(Facing::Back);
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result, {.mirror = MirrorMode::Auto});
+    fixture.Drain();
+    Check(fixture.context.backend->options.mirror == MirrorMode::Off,
+          "Auto photo mirror must leave rear cameras unmirrored.");
+    std::thread producer([backend = fixture.context.backend, image] {
+      backend->Complete(CameraResult<ImageAsset>::Success(image));
+    });
+    producer.join();
+    fixture.Await(result);
+    Check(result->Succeeded() && result->Value().PixelWidth() == 2 && result->Value().PixelHeight() == 1,
+          "Photo image dimensions must survive the async result.");
+    retained_photo = result->Value();
+  }
+  Check(retained_photo.EncodedBytes().size() == image.EncodedBytes().size(), "Photo bytes must outlive the camera.");
+  for (bool background : {false, true}) {
+    PhotoTestFixture fixture;
+    const auto& owner = fixture.context.owner;
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result);
+    fixture.Drain();
+    Check(owner->engaged && !owner->failure && owner->desired.facing == owner->opened_facing,
+          "Interruption scenarios must start with a healthy, matching camera configuration.");
+    auto options = CameraOptions{};
+    if (!background)
+      options.facing = Facing::Back;
+    owner->Update(options, background);
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::Interrupted, "Switching and background must interrupt photos.");
+    Check(owner->status->state == SessionState::Stopping, "Interruption must wait for native cleanup.");
+    fixture.context.backend->Complete(CameraResult<ImageAsset>::Success(image));
+    fixture.Drain();
+    Check(!owner->status->capturing_photo, "Late successful capture must release busy state.");
+    if (background)
+      Check(owner->status->state == SessionState::Suspended && !owner->failure,
+            "Background suspension must not be caused by an unrelated session failure.");
+  }
+  {
+    PhotoTestFixture fixture;
+    const auto owner = fixture.context.owner;
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result);
+    fixture.Drain();
+    fixture.context.visible = false;
+    fixture.Drain();
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::Interrupted, "Owner unmount must resolve an external caller.");
+    Check(!owner->backend, "Owner unmount must release its native backend reference.");
+    fixture.context.backend->Complete(CameraResult<ImageAsset>::Success(image));
+    fixture.Drain();
+    Check(owner->status->state == SessionState::Closed, "Late capture must not reopen an unmounted owner.");
+    result.reset();
+    (void)fixture.Launch(result);
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::NotReady, "Closed camera must reject photos.");
+  }
+}
+
 } // namespace
 
 int main() {
   try {
     TestGeometry();
     TestSessionLifetime();
-    std::cout << "Camera geometry and session lifetime tests passed.\n";
+    TestPhotoRequests();
+    std::cout << "Camera geometry, session lifetime, and photo request tests passed.\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
