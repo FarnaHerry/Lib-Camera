@@ -74,6 +74,14 @@ huxerui_add_library(huxerui_camera
             huxerui_camera
 )
 
+add_library(HuxerUI::Camera ALIAS huxerui_camera)
+
+# 打包前那趟「只出库图」的配置（HUXERUI_LIBRARY_GRAPH_ONLY=ON）里目标只是 INTERFACE 占位，
+# 不能再设 PUBLIC/PRIVATE 属性 —— 与 Lib-MediaPlayer / Lib-Live2D 同样的早退。
+if (HUXERUI_LIBRARY_GRAPH_ONLY)
+    return()
+endif ()
+
 target_include_directories(huxerui_camera PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
         "$<INSTALL_INTERFACE:include>"
@@ -91,8 +99,6 @@ if (APPLE)
     target_link_libraries(huxerui_camera PRIVATE "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
         "-framework CoreImage" "-framework ImageIO")
 endif ()
-
-add_library(HuxerUI::Camera ALIAS huxerui_camera)
 
 option(HUXERUI_CAMERA_BUILD_TESTS "Build Camera module tests" OFF)
 if (HUXERUI_CAMERA_BUILD_TESTS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
