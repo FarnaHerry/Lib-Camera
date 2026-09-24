@@ -602,10 +602,10 @@ private:
 
 } // namespace
 
-void InstallPlatformCamera(RootContext& root) {
+void InstallPlatformCamera(ApplicationContext& root) {
   root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
       camera_module_name, ios::PlatformModuleFactory<std::shared_ptr<CameraBackend>>{
-          .create = [](PlatformAdapter&, UIViewController* owner) -> std::shared_ptr<CameraBackend> {
+          .create = [](UiWindow&, UIViewController* owner) -> std::shared_ptr<CameraBackend> {
             return std::make_shared<IOSCamera>(owner);
           },
       }

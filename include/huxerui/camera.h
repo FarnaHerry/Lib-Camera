@@ -8,7 +8,7 @@
 #include <huxerui/external_texture.h>
 #include <huxerui/data.h>
 #include <huxerui/resource.h>
-#include <huxerui/root.h>
+#include <huxerui/app.h>
 #include <huxerui/task.h>
 #include <huxerui/view.h>
 
@@ -247,7 +247,7 @@ private:
 };
 
 /// Installs the camera platform module for an application root.
-/// Register this function in AppOptions::root_hooks before composing content that calls UseCamera.
+/// Register this function in AppOptions::application_hooks before composing content that calls UseCamera.
 /// Registration neither opens a camera nor requests authorization. Unsupported capture platforms report
 /// CameraErrorCode::Unavailable when capture is requested.
 /// @param root Application root context supplied by HuxerUI when it runs the registered hook.
@@ -255,13 +255,13 @@ private:
 /// const huxerui::Application application{
 ///     App,
 ///     {
-///         .root_hooks = {
+///         .application_hooks = {
 ///             huxerui::camera::Install,
 ///         },
 ///     }
 /// };
 /// @endcode
-void Install(RootContext& root);
+void Install(ApplicationContext& root);
 
 /// Retains a camera session in the current composition and applies the requested capture intent.
 /// Call from an active composition on the UI thread, with Install registered for its root.

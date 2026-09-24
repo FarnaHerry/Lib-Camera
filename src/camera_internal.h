@@ -22,7 +22,7 @@ public:
   }
 };
 
-void InstallPlatformCamera(RootContext& root);
+void InstallPlatformCamera(ApplicationContext& root);
 
 struct PreviewPlacement {
   Rect source;

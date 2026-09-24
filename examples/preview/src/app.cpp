@@ -519,10 +519,10 @@ const Application application{
             .minimum_size = Size{360.0F, 480.0F},
         },
         .show_debug_overlay = false,
-        .root_hooks = {
+        .application_hooks = {
             huxerui::camera::Install,
 #if defined(__ANDROID__)
-            [](RootContext& root) {
+            [](ApplicationContext& root) {
               android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;
               factory.class_name = "org.huxerui.lib.camera.preview.PhotoThumbnailModule";
               factory.create = [](PlatformChannel channel) {

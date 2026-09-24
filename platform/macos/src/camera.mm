@@ -404,9 +404,9 @@ private:
 
 } // namespace
 
-void InstallPlatformCamera(RootContext& root) {
+void InstallPlatformCamera(ApplicationContext& root) {
   root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
-      camera_module_name, [](PlatformAdapter&) -> std::shared_ptr<CameraBackend> {
+      camera_module_name, [](UiWindow&) -> std::shared_ptr<CameraBackend> {
         return std::make_shared<AppleCamera>();
       }
   );

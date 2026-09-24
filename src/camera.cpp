@@ -4,7 +4,7 @@
 
 namespace huxerui::camera {
 
-void Install(RootContext& root) {
+void Install(ApplicationContext& root) {
   detail::InstallPlatformCamera(root);
 }
 
