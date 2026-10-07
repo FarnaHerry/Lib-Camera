@@ -1,5 +1,7 @@
 # HuxerUI Camera
 
+This downstream fork maintains application fixes on `farna/main`, including the library-graph-only configuration guard and current application/window ownership contracts. The official baseline is tracked through `upstream/main` from `HuxerUI/Lib-Camera`. Consumers should pin a validated commit and use matching C++ and Android Java revisions.
+
 Camera preview and JPEG photo capture for HuxerUI applications on Android, iOS, macOS, and Windows.
 
 Use `UseCamera` to control a camera session, `CameraPreview` to display it, and `CapturePhotoAsync` to take photos. Multiple previews can share one session with independent fitting and mirroring. Preview frames update without recomposing the UI on every frame.
