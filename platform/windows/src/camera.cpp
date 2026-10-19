@@ -1,6 +1,7 @@
 #include "camera_windows.h"
 
 #include <huxerui/windows/external_texture.h>
+#include <huxerui/windows/platform_registry.h>
 
 #include <d3d11.h>
 #include <mfapi.h>
@@ -519,40 +520,58 @@ private:
 
 class WindowsCamera final : public CameraBackend {
 public:
-  WindowsCamera() : capture_(std::make_shared<WindowsCapture>()) {}
+  explicit WindowsCamera(HWND window)
+      : capture_(std::make_shared<WindowsCapture>()), screen_(CreateWindowsScreenCamera(window)) {}
   ~WindowsCamera() override {
-    if (needs_stop_)
-      capture_->Post([capture = capture_] { capture->Stop({}); });
+    if (needs_stop_) {
+      if (screen_active_) screen_->Stop({});
+      else capture_->Post([capture = capture_] { capture->Stop({}); });
+    }
   }
 
   void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
+    screen_active_ = false;
     capture_->Post([capture = capture_, facing, changed = std::move(changed)] { capture->Start(facing, changed); });
     needs_stop_ = true;
   }
 
+  void StartScreen(std::function<void(CameraStatus)> changed) override {
+    screen_active_ = true;
+    screen_->StartScreen(std::move(changed));
+    needs_stop_ = true;
+  }
+
+  void SetScreenRegion(std::optional<Rect> region) override {
+    screen_->SetScreenRegion(region);
+  }
+
   void Stop(std::function<void()> completed) override {
-    capture_->Post([capture = capture_, completed = std::move(completed)] { capture->Stop(completed); });
+    if (screen_active_) screen_->Stop(std::move(completed));
+    else capture_->Post([capture = capture_, completed = std::move(completed)] { capture->Stop(completed); });
     needs_stop_ = false;
   }
 
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
-    capture_->Post([capture = capture_, options, completed = std::move(completed)] { capture->Photo(options, completed); });
+    if (screen_active_) screen_->CapturePhoto(options, std::move(completed));
+    else capture_->Post([capture = capture_, options, completed = std::move(completed)] { capture->Photo(options, completed); });
   }
 
 private:
   std::shared_ptr<WindowsCapture> capture_;
+  std::shared_ptr<CameraBackend> screen_;
   bool needs_stop_ = false;
+  bool screen_active_ = false;
 };
 
 } // namespace
 
-std::shared_ptr<CameraBackend> CreateWindowsCamera() {
-  return std::make_shared<WindowsCamera>();
+std::shared_ptr<CameraBackend> CreateWindowsCamera(HWND window) {
+  return std::make_shared<WindowsCamera>(window);
 }
 
 void InstallPlatformCamera(ApplicationContext& root) {
   root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
-      camera_module_name, [](UiWindow&) { return CreateWindowsCamera(); });
+      camera_module_name, [](UiWindow& window) { return CreateWindowsCamera(windows::NativeWindow(window)); });
 }
 
 } // namespace huxerui::camera::detail

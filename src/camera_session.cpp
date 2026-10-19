@@ -93,13 +93,22 @@ void CameraSessionData::Update(CameraOptions options, bool is_background) {
   Reconcile();
 }
 
+void CameraSessionData::SetScreenRegion(std::optional<Rect> region) {
+  if (closed || screen_region == region) return;
+  screen_region = region;
+  if (backend && desired.source == CaptureSource::Screen)
+    backend->SetScreenRegion(region);
+}
+
 void CameraSessionData::Reconcile() {
   if (closed || !backend || status->state == SessionState::Stopping) {
     return;
   }
   if (!desired.active || background || failure ||
-      (status->state == SessionState::Starting && desired.facing != opened_facing) ||
-      (engaged && desired.facing != opened_facing)) {
+      (status->state == SessionState::Starting &&
+       (desired.source != opened_source || (desired.source == CaptureSource::Camera && desired.facing != opened_facing))) ||
+      (engaged &&
+       (desired.source != opened_source || (desired.source == CaptureSource::Camera && desired.facing != opened_facing)))) {
     const auto stopping_generation = ++generation;
     permission_check.Cancel();
     InterruptPhoto();
@@ -127,12 +136,15 @@ void CameraSessionData::Reconcile() {
     return;
   }
   opened_facing = desired.facing;
+  opened_source = desired.source;
   Publish(SessionState::Starting);
   const auto opening_generation = ++generation;
   const auto weak = weak_from_this();
   permission_check = tasks.Launch([weak, app = application, opening_generation]() -> Task<void> {
     try {
-      const auto permission = co_await app.CheckPermissionAsync(Permission::Camera);
+      PermissionStatus permission = PermissionStatus::Granted;
+      if (auto pending = weak.lock(); pending && pending->opened_source == CaptureSource::Camera)
+        permission = co_await app.CheckPermissionAsync(Permission::Camera);
       auto self = weak.lock();
       if (!self || self->closed || self->generation != opening_generation) {
         co_return;
@@ -149,7 +161,7 @@ void CameraSessionData::Reconcile() {
         co_return;
       }
       self->engaged = true;
-      self->backend->Start(self->opened_facing, [weak, scope = self->tasks, opening_generation](CameraStatus value) {
+      auto changed = [weak, scope = self->tasks, opening_generation](CameraStatus value) {
         scope.Post([weak, opening_generation, value = std::move(value)]() mutable {
           auto owner = weak.lock();
           if (!owner || owner->closed || owner->generation != opening_generation) {
@@ -165,7 +177,13 @@ void CameraSessionData::Reconcile() {
             owner->status = std::move(value);
           }
         });
-      });
+      };
+      if (self->opened_source == CaptureSource::Screen) {
+        self->backend->SetScreenRegion(self->screen_region);
+        self->backend->StartScreen(std::move(changed));
+      } else {
+        self->backend->Start(self->opened_facing, std::move(changed));
+      }
     } catch (const std::exception& error) {
       if (auto self = weak.lock(); self && !self->closed && self->generation == opening_generation) {
         self->failure = CameraError{CameraErrorCode::CaptureFailed, error.what()};

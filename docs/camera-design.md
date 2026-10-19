@@ -6,6 +6,12 @@ Status: the shared API, session ownership, preview drawing, Android capture, ind
 
 The Camera module manages capture through `CameraSession`, publishes preview frames through platform `ExternalTexture` implementations, and displays them inside HuxerUI through `camera::CameraPreview`.
 
+The screen source uses a different presentation path: `ScreenPreview` anchors a rectangular native window aperture and publishes no preview texture. The desktop compositor shows the underlying desktop directly. Windows uses a subtracted window region; macOS uses an AppKit transparent window and a Core Animation mask (unverified on macOS). Selection has no capture loop or periodic timer. Window notifications and layout geometry keep the aperture aligned, and stop/unmount restores the native window state.
+
+`CapturePhotoAsync` resolves and freezes the screen rectangle on the UI thread, starts an on-demand native capture, crops and encodes the first usable frame, and closes capture before completion. Startup latency means the result is a fresh image of that rectangle rather than an exact button-press timestamp. Windows uses Windows Graphics Capture and D3D11 staging readback; macOS uses a temporary ScreenCaptureKit stream, Core Image, and ImageIO. Screen Recording permission is relevant only to a capture request on macOS. The common single-request, cancellation, stop, and error contracts also apply to screen photos. No raw-frame read API is exposed.
+
+Application overlays cannot render in a native aperture. Keep borders and controls outside it and unmount its anchor while displaying overlapping sheets or dialogs. Screen mode reports `Running` when its anchor is valid while `CameraStatus::preview` remains empty. The Windows interior passes native pointer input through; macOS pointer behavior still requires hardware verification. Ordinary View fitting, mirroring, corner radii, and path clipping do not reshape the rectangular native aperture.
+
 The default implementation does not embed Android PreviewView or Apple native preview layers through PlatformView. The camera produces frames; HuxerUI handles layout, clipping, transforms, gestures, and surrounding UI. If later measurements justify native preview on a particular platform, evaluate it separately. The initial version does not offer two interchangeable preview backends.
 
 ```mermaid

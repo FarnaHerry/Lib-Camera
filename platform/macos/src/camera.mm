@@ -6,7 +6,9 @@
 #include <utility>
 
 #include <huxerui/macos/external_texture.h>
+#include <huxerui/macos/platform_registry.h>
 
+#include "camera_macos.h"
 #include "camera_internal.h"
 
 using namespace huxerui;
@@ -387,28 +389,42 @@ namespace {
 
 class AppleCamera final : public CameraBackend {
 public:
-  AppleCamera() : capture_([HUXCameraCapture new]) {}
+  explicit AppleCamera(NSWindow* window)
+      : capture_([HUXCameraCapture new]), screen_(CreateMacScreenCamera(window)) {}
   void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
+    screen_active_ = false;
     [capture_ start:facing changed:std::move(changed)];
   }
+  void StartScreen(std::function<void(CameraStatus)> changed) override {
+    screen_active_ = true;
+    screen_->StartScreen(std::move(changed));
+  }
+  void SetScreenRegion(std::optional<Rect> region) override {
+    screen_->SetScreenRegion(region);
+  }
   void Stop(std::function<void()> completed) override {
-    [capture_ stop:std::move(completed)];
+    if (screen_active_) screen_->Stop(std::move(completed));
+    else [capture_ stop:std::move(completed)];
   }
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
-    [capture_ capturePhoto:options completed:std::move(completed)];
+    if (screen_active_) screen_->CapturePhoto(options, std::move(completed));
+    else [capture_ capturePhoto:options completed:std::move(completed)];
   }
 
 private:
   HUXCameraCapture* capture_;
+  std::shared_ptr<CameraBackend> screen_;
+  bool screen_active_ = false;
 };
 
 } // namespace
 
 void InstallPlatformCamera(ApplicationContext& root) {
   root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
-      camera_module_name, [](UiWindow&) -> std::shared_ptr<CameraBackend> {
-        return std::make_shared<AppleCamera>();
-      }
+      camera_module_name, macos::PlatformModuleFactory<std::shared_ptr<CameraBackend>>{
+          .create = [](UiWindow&, NSWindow* window) -> std::shared_ptr<CameraBackend> {
+            return std::make_shared<AppleCamera>(window);
+          }}
   );
 }
 

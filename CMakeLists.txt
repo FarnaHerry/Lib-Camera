@@ -91,13 +91,18 @@ target_include_directories(huxerui_camera PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/s
 
 if (WIN32)
     target_compile_definitions(huxerui_camera PRIVATE NOMINMAX UNICODE _UNICODE)
-    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 windowscodecs runtimeobject ole32 oleaut32)
+    target_link_libraries(huxerui_camera PRIVATE mfplat mf mfuuid d3d11 windowscodecs runtimeobject windowsapp ole32 oleaut32
+        comctl32 user32 gdi32)
 endif ()
 
 if (APPLE)
     target_compile_options(huxerui_camera PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
     target_link_libraries(huxerui_camera PRIVATE "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
         "-framework CoreImage" "-framework ImageIO")
+    if (NOT IOS)
+        target_link_options(huxerui_camera PUBLIC "LINKER:SHELL:-weak_framework ScreenCaptureKit")
+        target_link_libraries(huxerui_camera PRIVATE "-framework AppKit" "-framework QuartzCore")
+    endif ()
 endif ()
 
 option(HUXERUI_CAMERA_BUILD_TESTS "Build Camera module tests" OFF)

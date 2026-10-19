@@ -113,4 +113,56 @@ ImageAsset EncodeWindowsPhoto(std::span<const std::byte> bytes, PhotoOptions opt
   return ImageAsset::FromEncoded(std::move(jpeg));
 }
 
+ImageAsset EncodeWindowsScreenPhoto(std::span<const std::byte> pixels, unsigned width, unsigned height,
+                                    unsigned stride, PhotoOptions options) {
+  if (!width || !height || stride < width * 4ULL ||
+      pixels.size() < static_cast<std::size_t>(stride) * height || pixels.size() > std::numeric_limits<UINT>::max())
+    throw std::runtime_error("The screen returned invalid photo pixels.");
+  ComPtr<IWICImagingFactory> factory;
+  Require(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)));
+  ComPtr<IWICBitmap> bitmap;
+  Require(factory->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGRA, stride,
+      static_cast<UINT>(pixels.size()), reinterpret_cast<BYTE*>(const_cast<std::byte*>(pixels.data())), &bitmap));
+  ComPtr<IWICBitmapSource> source;
+  Require(bitmap.As(&source));
+  if (options.mirror == MirrorMode::On)
+    source = Transform(factory.Get(), source, WICBitmapTransformFlipHorizontal);
+  ComPtr<IStream> output;
+  Require(CreateStreamOnHGlobal(nullptr, TRUE, &output));
+  ComPtr<IWICBitmapEncoder> encoder;
+  Require(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder));
+  Require(encoder->Initialize(output.Get(), WICBitmapEncoderNoCache));
+  ComPtr<IWICBitmapFrameEncode> frame;
+  ComPtr<IPropertyBag2> properties;
+  Require(encoder->CreateNewFrame(&frame, &properties));
+  PROPBAG2 property{};
+  property.pstrName = const_cast<wchar_t*>(L"ImageQuality");
+  VARIANT quality{};
+  quality.vt = VT_R4;
+  quality.fltVal = static_cast<float>(options.jpeg_quality) / 100.0F;
+  Require(properties->Write(1, &property, &quality));
+  Require(frame->Initialize(properties.Get()));
+  Require(frame->SetSize(width, height));
+  WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+  Require(frame->SetPixelFormat(&format));
+  ComPtr<IWICFormatConverter> converter;
+  Require(factory->CreateFormatConverter(&converter));
+  Require(converter->Initialize(source.Get(), format, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                 WICBitmapPaletteTypeCustom));
+  Require(frame->WriteSource(converter.Get(), nullptr));
+  Require(frame->Commit());
+  Require(encoder->Commit());
+  STATSTG stat{};
+  Require(output->Stat(&stat, STATFLAG_NONAME));
+  if (stat.cbSize.QuadPart > std::numeric_limits<ULONG>::max())
+    throw std::runtime_error("The encoded screen photo is too large.");
+  Bytes jpeg(static_cast<std::size_t>(stat.cbSize.QuadPart));
+  Require(output->Seek({}, STREAM_SEEK_SET, nullptr));
+  ULONG read = 0;
+  Require(output->Read(jpeg.data(), static_cast<ULONG>(jpeg.size()), &read));
+  if (read != jpeg.size())
+    throw std::runtime_error("Cannot read the encoded screen photo.");
+  return ImageAsset::FromEncoded(std::move(jpeg));
+}
+
 } // namespace huxerui::camera::detail

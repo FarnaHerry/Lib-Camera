@@ -7,6 +7,7 @@
 #include <winrt/Windows.Security.Authorization.AppCapabilityAccess.h>
 
 #include <chrono>
+#include <algorithm>
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
@@ -251,6 +252,154 @@ void TestDevice() {
   camera.reset();
   std::cout << "Native Windows preview, photos, pending-operation stops, facing selection and restart passed.\n";
 }
+
+LRESULT CALLBACK ScreenWindowProcedure(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
+  if (message == WM_PAINT) {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(window, &paint);
+    RECT bounds{};
+    GetClientRect(window, &bounds);
+    if (GetWindowLongPtrW(window, GWLP_USERDATA) == 1) {
+      RECT left{0, 0, (bounds.right - bounds.left) / 2, bounds.bottom};
+      RECT right{left.right, 0, bounds.right, bounds.bottom};
+      HBRUSH red = CreateSolidBrush(RGB(235, 20, 20));
+      HBRUSH green = CreateSolidBrush(RGB(20, 235, 20));
+      FillRect(dc, &left, red);
+      FillRect(dc, &right, green);
+      DeleteObject(red);
+      DeleteObject(green);
+    } else {
+      HBRUSH blue = CreateSolidBrush(RGB(20, 20, 235));
+      FillRect(dc, &bounds, blue);
+      DeleteObject(blue);
+    }
+    EndPaint(window, &paint);
+    return 0;
+  }
+  return DefWindowProcW(window, message, w_param, l_param);
+}
+
+void CheckScreenPhoto(const ImageAsset& photo, bool green, bool verify_color) {
+  Check(photo.PixelWidth() == 80 && photo.PixelHeight() == 60, "Screen photo dimensions are not the anchor size.");
+  const auto bytes = photo.EncodedBytes();
+  ComPtr<IWICImagingFactory> factory;
+  Require(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)));
+  ComPtr<IWICStream> stream;
+  Require(factory->CreateStream(&stream));
+  Require(stream->InitializeFromMemory(reinterpret_cast<BYTE*>(const_cast<std::byte*>(bytes.data())),
+                                       static_cast<DWORD>(bytes.size())));
+  ComPtr<IWICBitmapDecoder> decoder;
+  Require(factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder));
+  ComPtr<IWICBitmapFrameDecode> frame;
+  Require(decoder->GetFrame(0, &frame));
+  ComPtr<IWICFormatConverter> converter;
+  Require(factory->CreateFormatConverter(&converter));
+  Require(converter->Initialize(frame.Get(), GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone,
+                                nullptr, 0, WICBitmapPaletteTypeCustom));
+  BYTE pixel[3]{};
+  WICRect center{40, 30, 1, 1};
+  Require(converter->CopyPixels(&center, 3, 3, pixel));
+  std::cout << "Screen sample BGR: " << static_cast<int>(pixel[0]) << ','
+            << static_cast<int>(pixel[1]) << ',' << static_cast<int>(pixel[2]) << '\n';
+  if (verify_color)
+    Check(pixel[0] < 80 && (green ? pixel[1] > 170 && pixel[2] < 80
+                                  : pixel[2] > 170 && pixel[1] < 80),
+          "Screen capture did not reveal the content beneath the excluded window.");
+}
+
+void TestScreen() {
+  using namespace std::chrono_literals;
+  WNDCLASSW window_class{};
+  window_class.lpfnWndProc = ScreenWindowProcedure;
+  window_class.hInstance = GetModuleHandleW(nullptr);
+  window_class.lpszClassName = L"HuxerUICameraScreenTest";
+  Check(RegisterClassW(&window_class) != 0, "Cannot register screen test window.");
+  const int x = std::max(10, (GetSystemMetrics(SM_CXSCREEN) - 500) / 2);
+  const int y = std::max(10, (GetSystemMetrics(SM_CYSCREEN) - 300) / 2);
+  HWND background = CreateWindowExW(WS_EX_TOPMOST, window_class.lpszClassName, L"screen background", WS_POPUP,
+                                    x, y, 450, 250, nullptr, nullptr, window_class.hInstance, nullptr);
+  HWND foreground = CreateWindowExW(WS_EX_TOPMOST, window_class.lpszClassName, L"screen camera", WS_POPUP,
+                                    x + 20, y + 20, 120, 100, nullptr, nullptr, window_class.hInstance, nullptr);
+  Check(background && foreground, "Cannot create screen test windows.");
+  SetWindowLongPtrW(background, GWLP_USERDATA, 1);
+  ShowWindow(background, SW_SHOW);
+  UpdateWindow(background);
+  ShowWindow(foreground, SW_SHOW);
+  UpdateWindow(foreground);
+  const auto compose_until = std::chrono::steady_clock::now() + 500ms;
+  while (std::chrono::steady_clock::now() < compose_until) {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  HDC desktop = GetDC(nullptr);
+  COLORREF exposed = GetPixel(desktop, x + 180, y + 100);
+  ReleaseDC(nullptr, desktop);
+  const bool verify_color = GetRValue(exposed) > 170 && GetGValue(exposed) < 80 && GetBValue(exposed) < 80;
+  if (!verify_color)
+    std::cout << "Desktop compositor did not expose the test window; pixel content check will be skipped.\n";
+  auto camera = camera::detail::CreateWindowsScreenCamera(foreground);
+  auto probe = std::make_shared<DeviceProbe>();
+  camera->SetScreenRegion(Rect{10.0F, 10.0F, 80.0F, 60.0F});
+  camera->StartScreen([probe](CameraStatus value) {
+    std::lock_guard lock(probe->mutex);
+    probe->status = std::move(value);
+    probe->ready.notify_all();
+  });
+  probe->Await([&] { return probe->status.state == SessionState::Running || probe->status.error.has_value(); },
+               "Screen capture did not start.");
+  {
+    std::lock_guard lock(probe->mutex);
+    if (probe->status.error) throw std::runtime_error(probe->status.error->message);
+    Check(!probe->status.preview, "Transparent screen selection must not publish preview textures.");
+  }
+  HRGN aperture = CreateRectRgn(0, 0, 0, 0);
+  Check(aperture && GetWindowRgn(foreground, aperture) == COMPLEXREGION,
+        "Screen selection must make a native window aperture.");
+  Check(!PtInRegion(aperture, 50, 40) && PtInRegion(aperture, 5, 5),
+        "The viewfinder interior must be transparent while its surrounding controls remain visible.");
+  DeleteObject(aperture);
+  const auto take = [&](bool green) {
+    probe->photo.reset();
+    camera->CapturePhoto({}, [probe](CameraResult<ImageAsset> result) {
+      std::lock_guard lock(probe->mutex);
+      probe->photo = std::move(result);
+      probe->ready.notify_all();
+    });
+    probe->Await([&] { return probe->photo.has_value(); }, "Screen photo did not complete.");
+    if (!probe->photo->Succeeded()) throw std::runtime_error(probe->photo->Error().message);
+    CheckScreenPhoto(probe->photo->Value(), green, verify_color);
+  };
+  take(false);
+  MoveWindow(foreground, x + 300, y + 20, 120, 100, TRUE);
+  std::this_thread::sleep_for(300ms);
+  take(true);
+  camera->SetScreenRegion(std::nullopt);
+  aperture = CreateRectRgn(0, 0, 0, 0);
+  Check(GetWindowRgn(foreground, aperture) != ERROR && PtInRegion(aperture, 50, 40),
+        "Removing the screen anchor must close its aperture for overlapping application UI.");
+  DeleteObject(aperture);
+  camera->Stop([probe] {
+    std::lock_guard lock(probe->mutex);
+    probe->stopped = true;
+    probe->ready.notify_all();
+  });
+  probe->Await([&] { return probe->stopped; }, "Screen capture did not stop.");
+  DWORD restored_affinity = WDA_EXCLUDEFROMCAPTURE;
+  Check(GetWindowDisplayAffinity(foreground, &restored_affinity) && restored_affinity == WDA_NONE,
+        "Stopping screen capture must restore window display affinity.");
+  aperture = CreateRectRgn(0, 0, 0, 0);
+  Check(GetWindowRgn(foreground, aperture) == ERROR, "Stopping must restore the original unshaped window.");
+  DeleteObject(aperture);
+  DestroyWindow(foreground);
+  DestroyWindow(background);
+  UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
+  std::cout << "Native aperture, on-demand photos, window movement, and window restoration passed."
+            << (verify_color ? " Pixel content passed.\n" : " Pixel content remains unverified.\n");
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -262,6 +411,8 @@ int main(int argc, char** argv) {
     TestPhotos();
     if (argc > 1 && std::string_view(argv[1]) == "--device")
       TestDevice();
+    if (argc > 1 && std::string_view(argv[1]) == "--screen")
+      TestScreen();
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     result = 1;

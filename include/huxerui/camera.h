@@ -23,6 +23,12 @@ enum class Facing {
   Back,
 };
 
+/// Selects the producer for a camera session.
+enum class CaptureSource {
+  Camera,
+  Screen,
+};
+
 /// Selects the final horizontal mirror appearance of an upright preview or photo.
 /// CameraPreview accounts for PreviewOutput::mirrored to avoid applying mirroring twice.
 enum class MirrorMode {
@@ -123,12 +129,16 @@ struct PhotoOptions {
 /// These options control the shared device; per-preview appearance belongs to PreviewOptions.
 struct CameraOptions {
   /// Required camera facing, or an empty value to select the platform's default video device.
-  /// An explicit facing has no fallback to the opposite facing. Changing it while active reopens capture.
+  /// An explicit facing has no fallback to the opposite facing. Changing it while active reopens camera capture.
+  /// Ignored when source is CaptureSource::Screen.
   std::optional<Facing> facing;
   /// Whether capture is requested; true by default.
-  /// False stops capture asynchronously. True starts only with existing camera authorization.
+  /// False stops capture asynchronously. Camera capture starts only with existing camera authorization.
   /// Backgrounding suspends capture without changing this intent; foregrounding reevaluates it.
   bool active = true;
+  /// Screen opens a transparent ScreenPreview aperture and captures that desktop area only on a photo request.
+  /// Selecting an area does not request camera permission or start a screen capture stream.
+  CaptureSource source = CaptureSource::Camera;
 
   bool operator==(const CameraOptions&) const = default;
 };
@@ -216,12 +226,13 @@ public:
   /// @endcode
   void Retry() const;
 
-  /// Captures a JPEG photo through the native still-photo output of the current camera.
+  /// Captures a JPEG photo from the current source.
   /// Start from a UI event or Task, not during composition. The lazy task checks readiness when it runs.
   /// Only one request is accepted at a time; additional requests return OperationInProgress without queuing.
   /// The target orientation and resolved mirror mode are fixed when the request is accepted.
   /// Success returns an independent ImageAsset with upright pixels, normal EXIF orientation, and scale 1.
-  /// Photo dimensions are negotiated by the native output, independently of the preview's layout or Cover crop.
+  /// Camera photo dimensions are negotiated by the native output, independently of preview layout.
+  /// Screen photo dimensions follow the ScreenPreview anchor in physical display pixels.
   /// Stopping, switching, backgrounding, or session failure ends a pending request with Interrupted.
   /// An individual photo error does not set CameraStatus::error or stop otherwise healthy preview capture.
   /// Task cancellation suppresses delivery; native cleanup continues before another request is accepted.
@@ -244,6 +255,7 @@ private:
   std::shared_ptr<detail::CameraSessionData> data_;
 
   friend CameraSession UseCamera(CameraOptions, const std::source_location&);
+  friend View ScreenPreview(CameraSession, PreviewOptions);
 };
 
 /// Installs the camera platform module for an application root.
@@ -268,12 +280,13 @@ void Install(ApplicationContext& root);
 /// Recomposition at the same retained call site updates the existing session. Distinct calls own separate
 /// sessions; share a returned handle when multiple previews should use one device.
 ///
-/// Authorization is checked before starting, but no permission prompt is shown. The application requests
-/// Permission::Camera through ApplicationHandle::RequestPermissionAsync when appropriate.
+/// Camera authorization is checked before starting a camera source, but no permission prompt is shown.
+/// The application requests Permission::Camera through ApplicationHandle::RequestPermissionAsync when appropriate.
+/// A screen source does not use camera permission; the desktop operating system may require screen-recording access.
 /// Missing authorization is reported through CameraStatus::error. Unmounting the owner closes the session;
 /// merely unmounting a CameraPreview does not stop capture. Mark reusable functions that call this hook
 /// with [[huxerui::composable]].
-/// @param options Requested camera facing and active state. Defaults to the platform's default camera and active=true.
+/// @param options Requested source, camera facing and active state. Defaults to the platform's default camera and active=true.
 /// @param location Call-site metadata used to retain composition state; normally leave the default value.
 /// @return A shared handle for observing state, requesting retries, and creating previews.
 /// @code
@@ -324,5 +337,15 @@ void Install(ApplicationContext& root);
 /// }.With(Spacing(12.0F));
 /// @endcode
 View CameraPreview(CameraSession session, PreviewOptions options = {});
+
+/// Opens a native transparent aperture at this View's bounds while the screen session is active.
+/// The desktop compositor supplies the visible content; no preview texture or continuous capture is produced.
+/// Exactly one ScreenPreview may be mounted per screen session, with at most one active screen session per window.
+/// Put borders and controls outside this rectangle: drawing over an aperture is hidden, and its interior passes clicks
+/// to windows behind it. Unmount the anchor while showing overlapping application dialogs or sheets.
+/// Size uses ordinary View layout; the native aperture and photos are rectangular. PreviewOptions are ignored.
+/// CapturePhotoAsync obtains a fresh screen image for the rectangle resolved when the request is made.
+/// A screen session without a nonempty anchor cannot take a photo; CameraStatus::preview stays empty in screen mode.
+View ScreenPreview(CameraSession session, PreviewOptions options = {});
 
 } // namespace huxerui::camera

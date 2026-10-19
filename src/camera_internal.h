@@ -13,6 +13,11 @@ class CameraBackend {
 public:
   virtual ~CameraBackend() = default;
   virtual void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) = 0;
+  virtual void StartScreen(std::function<void(CameraStatus)> changed) {
+    changed({.state = SessionState::Failed,
+             .error = CameraError{CameraErrorCode::Unavailable, "Screen capture is unavailable on this platform."}});
+  }
+  virtual void SetScreenRegion(std::optional<Rect>) {}
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
   /// Delivers one independent, upright JPEG. Stop must wait for accepted native photo work to finish cleanup.

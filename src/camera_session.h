@@ -21,6 +21,8 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   std::shared_ptr<CameraBackend> backend;
   CameraOptions desired;
   std::optional<Facing> opened_facing;
+  CaptureSource opened_source = CaptureSource::Camera;
+  std::optional<Rect> screen_region;
   std::optional<CameraError> failure;
   TaskHandle permission_check;
   std::uint64_t generation = 0;
@@ -35,6 +37,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
   void Publish(SessionState state);
   void Update(CameraOptions options, bool is_background);
   void Reconcile();
+  void SetScreenRegion(std::optional<Rect> region);
   void Settle();
   void Close();
 };

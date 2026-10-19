@@ -6,6 +6,25 @@ Camera preview and JPEG photo capture for HuxerUI applications on Android, iOS, 
 
 Use `UseCamera` to control a camera session, `CameraPreview` to display it, and `CapturePhotoAsync` to take photos. Multiple previews can share one session with independent fitting and mirroring. Preview frames update without recomposing the UI on every frame.
 
+## Screen as a Camera Source
+
+Screen selection uses a native transparent aperture, so the desktop beneath the window remains directly visible while choosing a position. Select `CaptureSource::Screen` and mount one `ScreenPreview` per session, with at most one active screen session per window. No screen stream, preview texture, or periodic frame processing runs while selecting. Only `CapturePhotoAsync` starts capture and reads a fresh image; capture resources close before that request finishes.
+
+```cpp
+auto session = camera::UseCamera({.active = active, .source = camera::CaptureSource::Screen});
+return Column {
+  camera::ScreenPreview(session).With(Frame{.width = 100.0F, .height = 100.0F}),
+}.With(Padding(2.0F), Border(Color::White(), 2.0F));
+```
+
+The aperture follows the anchor's position and size within the application window. A 100×100 logical-unit aperture selects that area of the desktop; photo dimensions use physical display pixels and can differ with display scaling. The rectangle is resolved when a photo request is accepted, and the resulting JPEG comes from a newly delivered screen frame. Capture startup adds latency, so it does not promise the exact pixels at the instant of the button press. Moving the window during capture does not move that request's frozen rectangle. An anchor spanning displays or leaving the display is unavailable until wholly inside one display.
+
+The aperture is rectangular. Put borders and controls outside it; application drawing inside its bounds, including grids or overlay controls, is hidden by the native mask. On Windows its interior passes mouse input to the desktop behind it. Unmount `ScreenPreview` while showing overlapping dialogs or sheets, then remount it after dismissal; the example does this for photo review. Native window geometry and display scaling determine placement, and ordinary `CornerRadius`, clips, fitting, and mirroring do not reshape the aperture. `PreviewOptions` are ignored for `ScreenPreview`; photo mirroring remains supported through `PhotoOptions`.
+
+`CameraStatus::preview` stays empty in screen mode; `Running` means selection is ready for a capture request. Additional `CameraPreview(session)` views have no screen texture to display. There is currently no separate raw-frame read API; callers can read the encoded bytes of the `ImageAsset` returned by `CapturePhotoAsync`.
+
+Screen mode does not request camera permission. Windows uses `SetWindowRgn` for the aperture and Windows Graphics Capture for each photo, excluding the application's top-level window; Windows 10 version 2004 or later is required. macOS uses a transparent AppKit window with a Core Animation mask, and starts ScreenCaptureKit only for each photo, excluding the application. It requires macOS 12.3 or later and Screen Recording access when taking a photo. The macOS aperture and capture implementation have **not been built or verified with a macOS SDK or hardware**, including mask coordinates and native mouse behavior. Linux, iOS, Android, and Web currently report `CameraErrorCode::Unavailable` for this source.
+
 Linux and Web capture are not supported; capture requests report `CameraErrorCode::Unavailable`.
 
 ## Installation
@@ -132,7 +151,7 @@ Task<bool> WritePhoto(ImageAsset photo, File destination) {
 }
 ```
 
-The destination must be writable and its parent directory must exist. Writing creates or truncates the file. Obtain application directories with `UseService<FileSystem>()` during composition.
+The destination must be writable and its parent directory must exist. Writing creates or truncates the file. Obtain application directories with `UseApplication().Directories()` during composition.
 
 To let the user choose a destination, write a temporary JPEG and export it with `FilePicker`:
 

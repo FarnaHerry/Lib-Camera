@@ -222,18 +222,18 @@ View PhotoImage(ImageAsset photo) {
 
 [[huxerui::composable]]
 View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, State<bool> saving) {
-  auto files = UseService<FileSystem>();
+  auto application = UseApplication();
   auto picker = UseService<FilePicker>();
   auto message = UseState(std::string{});
-  auto save = [tasks, files, picker, photo, saving, message] {
+  auto save = [tasks, application, picker, photo, saving, message] {
     if (saving.Get()) return;
     saving = true;
     message = std::string{};
-    tasks.Launch([files, picker, photo, saving, message]() -> Task<void> {
+    tasks.Launch([application, picker, photo, saving, message]() -> Task<void> {
       static std::atomic_uint64_t sequence{0};
       const auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
       const auto filename = "camera-" + std::to_string(timestamp) + "-" + std::to_string(++sequence) + ".jpg";
-      const File directory = files->Directories().temporary_directory.Child("camera-preview-exports");
+      const File directory = application.Directories().temporary_directory.Child("camera-preview-exports");
       const File temporary = directory.Child(filename);
       try {
         const bool prepared = co_await RunWorker([directory] {
@@ -277,8 +277,15 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
 }
 
 [[huxerui::composable]]
+View OpaqueSheet(State<bool> presented, View content) {
+  Lifecycle([presented] { return [presented] { presented = false; }; }, presented);
+  return content;
+}
+
+[[huxerui::composable]]
 View CameraWorkspace() {
   auto active = UseState(false);
+  auto source = UseState(camera::CaptureSource::Camera);
   auto facing = UseState(std::optional<camera::Facing>{});
   auto fit = UseState(ImageFit::Cover);
   auto mirror = UseState(camera::MirrorMode::Auto);
@@ -289,32 +296,41 @@ View CameraWorkspace() {
   auto photo = UseState(ImageAsset{});
   auto photo_error = UseState(std::string{});
   auto saving_photo = UseState(false);
+  auto sheet_presented = UseState(false);
   auto application = UseApplication();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
-  auto session = camera::UseCamera({.facing = facing.Get(), .active = active.Get()});
+  auto session = camera::UseCamera({.facing = facing.Get(), .active = active.Get(), .source = source.Get()});
   const auto status = session.Status();
   const bool expanded = UseViewportClass() == ViewportClass::Expanded;
-  const bool live = status.state == camera::SessionState::Running && status.preview.has_value();
+  const bool screen_mode = source.Get() == camera::CaptureSource::Screen;
+  const bool live = status.state == camera::SessionState::Running && (screen_mode || status.preview.has_value());
   const bool failed = status.state == camera::SessionState::Failed;
   const bool stopping = status.state == camera::SessionState::Stopping;
 
-  auto show_settings = [sheets, facing, fit, mirror, grid, comparison] {
-    sheets.Show([facing, fit, mirror, grid, comparison](BottomSheetContext sheet) {
-      return Column {
+  auto show_settings = [sheets, facing, fit, mirror, grid, comparison, sheet_presented] {
+    sheet_presented = true;
+    sheets.Show([facing, fit, mirror, grid, comparison, sheet_presented](BottomSheetContext sheet) {
+      return OpaqueSheet(sheet_presented, Column {
         Row {
           Label("Preview settings", 20.0F, foreground, FontWeight::SemiBold),
           Spacer(),
           IconButton(app::images::close, "Close settings").OnClick([sheet] { sheet.Dismiss(); }),
         }.With(CrossAlign(CrossAxisAlignment::Center)),
         ScrollView(CameraSettings(facing, fit, mirror, grid, comparison)).With(Grow()),
-      }.With(Padding(20.0F), Spacing(16.0F), Frame{.max_height = 580.0F}, CrossAlign(CrossAxisAlignment::Stretch));
+      }.With(Padding(20.0F), Spacing(16.0F), Frame{.max_height = 580.0F}, CrossAlign(CrossAxisAlignment::Stretch)));
     });
   };
 
-  auto toggle_camera = [active, authorizing, permission_error, application, tasks, session, failed] {
+  auto toggle_camera = [active, source, authorizing, permission_error, application, tasks, session, failed] {
     if (active.Get() && !failed) {
       active = false;
+      return;
+    }
+    if (source.Get() == camera::CaptureSource::Screen) {
+      permission_error = std::string{};
+      if (active.Get()) session.Retry();
+      else active = true;
       return;
     }
     authorizing = true;
@@ -353,11 +369,12 @@ View CameraWorkspace() {
       }
     });
   };
-  auto show_photo = [sheets, photo, tasks, saving_photo] {
+  auto show_photo = [sheets, photo, tasks, saving_photo, sheet_presented] {
     const auto image = photo.Get();
     if (!image.HasValue()) return;
-    sheets.Show([image, tasks, saving_photo](BottomSheetContext sheet) {
-      return PhotoReview(image, sheet, tasks, saving_photo);
+    sheet_presented = true;
+    sheets.Show([image, tasks, saving_photo, sheet_presented](BottomSheetContext sheet) {
+      return OpaqueSheet(sheet_presented, PhotoReview(image, sheet, tasks, saving_photo));
     });
   };
 
@@ -369,7 +386,8 @@ View CameraWorkspace() {
       Row {
         StatusBadge(status.state),
         Spacer(),
-        Label("PREVIEW", 10.0F, foreground, FontWeight::SemiBold)
+        Label(source.Get() == camera::CaptureSource::Screen ? "SCREEN" : "PREVIEW",
+              10.0F, foreground, FontWeight::SemiBold)
             .With(Padding(8.0F), Background(Color::Rgb(15, 18, 22, 0.88F)), CornerRadius(8.0F)),
       }.With(CrossAlign(CrossAxisAlignment::Center)),
       Spacer(),
@@ -391,14 +409,36 @@ View CameraWorkspace() {
       ClipChildren()
   );
 
+  if (screen_mode) {
+    viewfinder = Column {
+      (sheet_presented.Get() ? View(Spacer()) : camera::ScreenPreview(session)).With(Grow()),
+    }.With(
+        Grow(),
+        Padding(2.0F),
+        Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch),
+        CrossAlign(CrossAxisAlignment::Stretch),
+        Border(accent, 2.0F),
+        Background(Color::Black())
+    );
+  }
+
   View controls = Column {
+    SegmentedButton({"Camera", "Screen"}, source.Get() == camera::CaptureSource::Camera ? 0 : 1)
+        .OnChanged([source, active, permission_error](std::size_t index) {
+          active = false;
+          permission_error = std::string{};
+          source = index == 0 ? camera::CaptureSource::Camera : camera::CaptureSource::Screen;
+        }),
     Row {
       Column {
-        Label(FacingName(status.actual_facing ? status.actual_facing : facing.Get()),
+        Label(source.Get() == camera::CaptureSource::Screen ? "Desktop beneath viewfinder"
+              : FacingName(status.actual_facing ? status.actual_facing : facing.Get()),
               14.0F, foreground, FontWeight::Medium),
-        Label(fit.Get() == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
+        Label(screen_mode ? "Transparent viewfinder · capture on demand"
+              : fit.Get() == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
       }.With(Spacing(4.0F)),
       Spacer(),
+      screen_mode ? StatusBadge(status.state) : View(),
       IconButton(app::images::photo, "View last photo").OnClick(show_photo)
           .With(Enabled(photo.Get().HasValue()), Background(control_background), CornerRadius(14.0F)),
     }.With(CrossAlign(CrossAxisAlignment::Center)),
@@ -406,7 +446,8 @@ View CameraWorkspace() {
       IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
         const auto current = status.actual_facing ? status.actual_facing : facing.Get();
         facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
-      }).With(Enabled(!authorizing.Get() && !stopping), Background(control_background), CornerRadius(14.0F)),
+      }).With(Enabled(source.Get() == camera::CaptureSource::Camera && !authorizing.Get() && !stopping),
+              Background(control_background), CornerRadius(14.0F)),
       Button(authorizing.Get() ? "Requesting access" : stopping ? "Stopping camera"
           : status.capturing_photo ? "Taking photo" : live ? "Take photo"
           : failed || !permission_error.Get().empty() ? "Try again"
@@ -415,7 +456,7 @@ View CameraWorkspace() {
           .With(Grow(), Enabled(!authorizing.Get() && !stopping && !status.capturing_photo)),
       live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
           .With(Background(control_background), CornerRadius(14.0F))) : View(),
-      expanded ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
+      expanded || screen_mode ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
           .With(Background(control_background), CornerRadius(14.0F))),
     }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
     photo_error.Get().empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
@@ -434,7 +475,11 @@ View CameraWorkspace() {
         Label("Preview settings", 18.0F, foreground, FontWeight::SemiBold),
         Label("Make the frame your own.", 13.0F),
         Divider(),
-        ScrollView(CameraSettings(facing, fit, mirror, grid, comparison)).With(Grow()),
+        screen_mode ? View(Column {
+          Label("Move or resize this window to select the desktop area.", 14.0F),
+          Label("The green border marks the photo rectangle. Its transparent interior passes clicks through.", 13.0F),
+          Label("Take photo starts one capture and closes it after reading the image.", 13.0F),
+        }.With(Spacing(16.0F))) : View(ScrollView(CameraSettings(facing, fit, mirror, grid, comparison)).With(Grow())),
       }.With(
           Frame{.width = 300.0F},
           Padding(22.0F),

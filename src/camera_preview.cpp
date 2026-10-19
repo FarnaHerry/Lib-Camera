@@ -4,8 +4,37 @@
 #include <cmath>
 
 #include "camera_internal.h"
+#include "camera_session.h"
+
+#include <huxerui/layout.h>
+#include <huxerui/modifier.h>
 
 namespace huxerui::camera::detail {
+
+struct ScreenRegionModifier {
+  class Extension;
+  std::shared_ptr<CameraSessionData> session;
+};
+
+class ScreenRegionModifier::Extension final : public NodeExtension {
+public:
+  Extension(ViewNode& node, const ScreenRegionModifier& value) { Update(node, value); }
+  ~Extension() override {
+    if (session_) session_->SetScreenRegion(std::nullopt);
+  }
+  void Update(ViewNode&, const ScreenRegionModifier& value) {
+    if (session_ && session_ != value.session) session_->SetScreenRegion(std::nullopt);
+    session_ = value.session;
+  }
+  PaintInvalidation PrepareGeometry(ViewNode& node, TextMeasurer&) override {
+    const Rect bounds = node.LocalToWindowBounds(node.Bounds());
+    session_->SetScreenRegion(bounds.IsEmpty() ? std::nullopt : std::optional<Rect>(bounds));
+    return PaintInvalidation::None;
+  }
+
+private:
+  std::shared_ptr<CameraSessionData> session_;
+};
 
 std::optional<PreviewPlacement> PlacePreview(
     Size intrinsic, const PreviewOutput& output, PreviewOptions options, std::optional<Facing> facing, Size bounds
@@ -88,6 +117,12 @@ View CameraPreview(CameraSession session, PreviewOptions options) {
     paint.PopTransform();
     paint.PopClip();
   });
+}
+
+[[huxerui::composable]]
+View ScreenPreview(CameraSession session, PreviewOptions options) {
+  (void)options;
+  return Canvas([](PaintContext&, Size) {}).With(detail::ScreenRegionModifier{session.data_});
 }
 
 } // namespace huxerui::camera
