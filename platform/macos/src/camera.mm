@@ -399,7 +399,7 @@ public:
     screen_active_ = true;
     screen_->StartScreen(std::move(changed));
   }
-  void SetScreenRegion(std::optional<Rect> region) override {
+  void SetScreenRegion(std::optional<huxerui::Rect> region) override {
     screen_->SetScreenRegion(region);
   }
   void Stop(std::function<void()> completed) override {

@@ -27,7 +27,7 @@ struct ScreenArea {
   size_t height = 0;
 };
 
-std::optional<ScreenArea> ScreenRegion(NSWindow* window, std::optional<Rect> region) {
+std::optional<ScreenArea> ScreenRegion(NSWindow* window, std::optional<huxerui::Rect> region) {
   if (!window || !region || region->IsEmpty() || !std::isfinite(region->x) || !std::isfinite(region->y) ||
       !std::isfinite(region->width) || !std::isfinite(region->height) || !window.screen || !window.contentView ||
       window.miniaturized) return std::nullopt;
@@ -93,7 +93,7 @@ CameraResult<ImageAsset> EncodeScreenPhoto(CVPixelBufferRef buffer, PhotoOptions
   BOOL original_wants_layer_;
   bool selecting_;
   std::optional<bool> ready_;
-  std::optional<Rect> region_;
+  std::optional<huxerui::Rect> region_;
   NSMutableArray* observers_;
   std::function<void(CameraStatus)> changed_;
 
@@ -109,7 +109,7 @@ CameraResult<ImageAsset> EncodeScreenPhoto(CVPixelBufferRef buffer, PhotoOptions
 }
 - (instancetype)initWithWindow:(NSWindow*)window;
 - (void)start:(std::function<void(CameraStatus)>)changed;
-- (void)setRegion:(std::optional<Rect>)region;
+- (void)setRegion:(std::optional<huxerui::Rect>)region;
 - (void)stop:(std::function<void()>)completed;
 - (void)photo:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
 @end
@@ -153,7 +153,7 @@ CameraResult<ImageAsset> EncodeScreenPhoto(CVPixelBufferRef buffer, PhotoOptions
   }
 }
 
-- (void)setRegion:(std::optional<Rect>)region {
+- (void)setRegion:(std::optional<huxerui::Rect>)region {
   region_ = region;
   [self updateAperture];
 }
@@ -374,7 +374,7 @@ public:
              .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}});
   }
   void StartScreen(std::function<void(CameraStatus)> changed) override { [capture_ start:std::move(changed)]; }
-  void SetScreenRegion(std::optional<Rect> region) override { [capture_ setRegion:region]; }
+  void SetScreenRegion(std::optional<huxerui::Rect> region) override { [capture_ setRegion:region]; }
   void Stop(std::function<void()> completed) override { [capture_ stop:std::move(completed)]; }
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     [capture_ photo:options completed:std::move(completed)];
