@@ -1,7 +1,5 @@
 #include "camera_session.h"
 
-#include <condition_variable>
-#include <mutex>
 #include <utility>
 
 #include <huxerui/app.h>
@@ -15,24 +13,11 @@
 namespace huxerui::camera::detail {
 
 struct PhotoRequest {
-  std::mutex mutex;
-  std::condition_variable ready;
-  std::optional<CameraResult<ImageAsset>> result;
+  CallbackCompletion<CameraResult<ImageAsset>> completion;
+  bool completed = false;
 
   void Complete(CameraResult<ImageAsset> value) {
-    {
-      std::lock_guard lock(mutex);
-      if (result)
-        return;
-      result = std::move(value);
-    }
-    ready.notify_all();
-  }
-
-  CameraResult<ImageAsset> Wait() {
-    std::unique_lock lock(mutex);
-    ready.wait(lock, [this] { return result.has_value(); });
-    return *result;
+    if (!std::exchange(completed, true)) completion.Complete(std::move(value));
   }
 };
 
@@ -46,7 +31,8 @@ void CameraSessionData::InterruptPhoto() {
   }
 }
 
-void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request) {
+void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request,
+                                   bool preview_frame) {
   photo = request;
   auto value = status.Get();
   value.capturing_photo = true;
@@ -69,7 +55,11 @@ void CameraSessionData::BeginPhoto(PhotoOptions options, const std::shared_ptr<P
     });
   };
   try {
-    backend->CapturePhoto(options, complete);
+    if (preview_frame) {
+      backend->CapturePreviewFrame(options, complete);
+    } else {
+      backend->CapturePhoto(options, complete);
+    }
   } catch (const std::exception& error) {
     complete(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, error.what()}));
   }
@@ -213,19 +203,33 @@ void CameraSessionData::Close() {
   }
 }
 
+Task<CameraResult<ImageAsset>> Capture(std::shared_ptr<CameraSessionData> owner, PhotoOptions options,
+                                     bool preview_frame) {
+  return AwaitCallback<CameraResult<ImageAsset>>(
+      [owner = std::move(owner), options, preview_frame](CallbackCompletion<CameraResult<ImageAsset>> completion)
+          -> std::function<void()> {
+        if (owner->closed || !owner->engaged || !owner->desired.active || owner->background ||
+            owner->status->state != SessionState::Running) {
+          completion.Complete(CameraResult<ImageAsset>::Failure(
+              {CameraErrorCode::NotReady, "Start the camera before taking a photo."}));
+        } else if (owner->photo) {
+          completion.Complete(CameraResult<ImageAsset>::Failure(
+              {CameraErrorCode::OperationInProgress, "A photo capture is already in progress."}));
+        } else {
+          auto request = std::make_shared<PhotoRequest>(PhotoRequest{completion});
+          owner->BeginPhoto(options, request, preview_frame);
+        }
+        // Task cancellation suppresses delivery; native completion retains the busy slot until cleanup finishes.
+        return {};
+      });
+}
+
 Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> owner, PhotoOptions options) {
-  if (owner->closed || !owner->engaged || !owner->desired.active || owner->background ||
-      owner->status->state != SessionState::Running) {
-    co_return CameraResult<ImageAsset>::Failure({CameraErrorCode::NotReady, "Start the camera before taking a photo."});
-  }
-  if (owner->photo) {
-    co_return CameraResult<ImageAsset>::Failure(
-        {CameraErrorCode::OperationInProgress, "A photo capture is already in progress."});
-  }
-  auto request = std::make_shared<PhotoRequest>();
-  owner->BeginPhoto(options, request);
-  // Let the SDK own coroutine resumption and cancellation; native callbacks never resume a frame directly.
-  co_return co_await RunWorker([request] { return request->Wait(); });
+  return Capture(std::move(owner), options, false);
+}
+
+Task<CameraResult<ImageAsset>> CapturePreviewFrame(std::shared_ptr<CameraSessionData> owner, PhotoOptions options) {
+  return Capture(std::move(owner), options, true);
 }
 
 } // namespace huxerui::camera::detail
@@ -251,6 +255,14 @@ Task<CameraResult<ImageAsset>> CameraSession::CapturePhotoAsync(PhotoOptions opt
     throw std::invalid_argument("Invalid photo quality or mirror mode.");
   }
   return detail::CapturePhoto(data_, options);
+}
+
+Task<CameraResult<ImageAsset>> CameraSession::CapturePreviewFrameAsync(PhotoOptions options) const {
+  if (options.jpeg_quality < 1 || options.jpeg_quality > 100 ||
+      (options.mirror != MirrorMode::Auto && options.mirror != MirrorMode::Off && options.mirror != MirrorMode::On)) {
+    throw std::invalid_argument("Invalid photo quality or mirror mode.");
+  }
+  return detail::CapturePreviewFrame(data_, options);
 }
 
 CameraSession UseCamera(CameraOptions options, const std::source_location& location) {

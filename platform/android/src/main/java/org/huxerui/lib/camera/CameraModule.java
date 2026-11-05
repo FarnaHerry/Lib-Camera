@@ -10,7 +10,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.Surface;
-import android.view.WindowManager;
+import android.view.Display;
 
 import androidx.annotation.NonNull;
 import androidx.camera.core.Camera;
@@ -32,6 +32,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 import org.huxerui.HuxerUIPlatformChannel;
 import org.huxerui.HuxerUIPlatformModule;
+import org.huxerui.HuxerUIView;
 import org.huxerui.PlatformPayload;
 
 import java.io.ByteArrayOutputStream;
@@ -45,11 +46,11 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public final class CameraModule implements HuxerUIPlatformModule.Factory {
+public final class CameraModule implements HuxerUIPlatformModule.WindowFactory {
     @Override
-    public HuxerUIPlatformModule create(Context context, PlatformPayload options,
+    public HuxerUIPlatformModule create(HuxerUIView window, PlatformPayload options,
                                        HuxerUIPlatformChannel.Events events) {
-        return new Session(context, events);
+        return new Session(window, events);
     }
 
     private static native PlatformPayload createOutput(int width, int height, boolean swap);
@@ -59,6 +60,7 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
     private static final class Session implements HuxerUIPlatformModule, LifecycleOwner,
             DisplayManager.DisplayListener {
         private final Context context;
+        private final HuxerUIView window;
         private final HuxerUIPlatformChannel.Events events;
         private final Handler main = new Handler(Looper.getMainLooper());
         private final Executor executor = command -> main.post(command);
@@ -81,8 +83,9 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         private boolean disposed;
         private String facing;
 
-        Session(Context context, HuxerUIPlatformChannel.Events events) {
-            this.context = context;
+        Session(HuxerUIView window, HuxerUIPlatformChannel.Events events) {
+            this.window = window;
+            this.context = window.getContext();
             this.events = events;
             displays = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
             lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE);
@@ -350,15 +353,20 @@ public final class CameraModule implements HuxerUIPlatformModule.Factory {
         }
 
         private int displayRotation() {
-            WindowManager windows = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-            return windows.getDefaultDisplay().getRotation();
+            Display display = window.getDisplay();
+            return display == null ? Surface.ROTATION_0 : display.getRotation();
         }
 
         @Override public void onDisplayAdded(int displayId) {}
         @Override public void onDisplayRemoved(int displayId) {}
         @Override public void onDisplayChanged(int displayId) {
-            if (!active || preview == null || preview.getTargetRotation() == displayRotation()) return;
-            preview.setTargetRotation(displayRotation());
+            Display display = window.getDisplay();
+            if (!active || preview == null || display == null || display.getDisplayId() != displayId) return;
+            int rotation = display.getRotation();
+            if (preview.getTargetRotation() != rotation) preview.setTargetRotation(rotation);
+            if (photoOutput != null && photoOutput.getTargetRotation() != rotation) {
+                photoOutput.setTargetRotation(rotation);
+            }
         }
 
         private final class Output {

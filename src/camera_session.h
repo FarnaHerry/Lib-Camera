@@ -33,7 +33,7 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
 
   CameraSessionData(State<CameraStatus> value, TaskScope scope, ApplicationHandle app);
   void InterruptPhoto();
-  void BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request);
+  void BeginPhoto(PhotoOptions options, const std::shared_ptr<PhotoRequest>& request, bool preview_frame = false);
   void Publish(SessionState state);
   void Update(CameraOptions options, bool is_background);
   void Reconcile();
@@ -43,5 +43,6 @@ struct CameraSessionData : std::enable_shared_from_this<CameraSessionData> {
 };
 
 Task<CameraResult<ImageAsset>> CapturePhoto(std::shared_ptr<CameraSessionData> owner, PhotoOptions options);
+Task<CameraResult<ImageAsset>> CapturePreviewFrame(std::shared_ptr<CameraSessionData> owner, PhotoOptions options);
 
 } // namespace huxerui::camera::detail

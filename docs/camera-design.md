@@ -1,6 +1,6 @@
 # HuxerUI Camera Module Design
 
-Status: the shared API, session ownership, preview drawing, Android capture, independent macOS/iOS AVFoundation backends, and Windows Media Foundation capture are implemented. Android preview, geometry, switching, and background recovery were confirmed on TAS_AN00 after updating the installed SDK. iOS device and Simulator targets build with the corrected SDK dependency exports, and the Simulator example launches; the user also confirmed successful physical iOS device testing after the SDK link fix. Windows preview and JPEG capture were verified at 1280×720 with an ACER HD User Facing camera, and the user confirmed the example works. See README.md for build limitations and verified implementation status.
+Status: the shared API, session ownership, preview drawing, Android capture, independent macOS/iOS AVFoundation backends, Windows Media Foundation capture, and Linux V4L2 capture are implemented. Android preview, geometry, switching, and background recovery were confirmed on TAS_AN00 after updating the installed SDK. iOS device and Simulator targets build with the corrected SDK dependency exports, and the Simulator example launches; the user also confirmed successful physical iOS device testing after the SDK link fix. Windows preview and JPEG capture were verified at 1280×720 with an ACER HD User Facing camera, and the user confirmed the example works. Linux preview and JPEG capture were verified at 1920×1080 with a USB webcam through the automated device tests and a full GTK application probe. See README.md for build limitations and verified implementation status.
 
 ## Design Decision
 
@@ -129,7 +129,7 @@ public:
   [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 };
 
-void Install(RootContext& root);
+void Install(ApplicationContext& root);
 
 [[nodiscard]] CameraSession UseCamera(
     CameraOptions options = {},
@@ -190,6 +190,8 @@ The first format is JPEG, with quality 1–100 and scale 1. The native target or
 Android binds ImageCapture with Preview and performs JPEG normalization on a separate executor. The iOS and macOS implementations remain separate; each owns AVCapturePhotoOutput, a per-request delegate retained through final capture, and a photo processing queue. Stop completion waits for both preview release and photo cleanup. Unsupported preview/photo output combinations fall back to preview where configuration APIs can detect the limitation.
 
 The current SDK has no public callback-to-Task completion primitive. The private request stores one completion behind a condition variable; RunWorker bridges that completion through the SDK's existing cancellation and UI-dispatch contract. Native callbacks never directly resume coroutine frames. At most one such wait belongs to a session, and interruption releases it independently of native cleanup.
+
+`CapturePreviewFrameAsync` shares that request machinery and the one-request-at-a-time rule. It delivers a JPEG of the newest frame the live preview is showing without changing the capture mode: backends that can read their newest frame directly do so, and the rest delegate to the native still-photo output. Resolution therefore follows the preview stream rather than a separate photo negotiation. Applications choose it for an immediate what-you-see-is-what-you-get snapshot and `CapturePhotoAsync` when the native photo resolution matters.
 
 Saving is composed with the SDK File and FilePicker APIs. Write ImageAsset::EncodedBytes() to an application-owned file, or prepare a temporary file and pass it to FilePicker::SaveFileAsync() for user-directed export. CameraSession does not add a duplicate SavePhotoAsync wrapper, select paths, or create photo-library entries. The example supports capture, photo review, and file export. See README.md for complete English usage examples and validation scope.
 
@@ -279,6 +281,8 @@ Provide a CameraX lifecycle binding owned by the module and controlled by Sessio
 
 Read SurfaceRequest's TransformationInfo, verify which Surface transformations the SDK already consumes, and compute the remaining geometry. Do not unconditionally apply both the Surface transform and the full sensor rotation.
 
+The Android camera registers `android::JavaWindowPlatformModuleFactory` and implements Java `HuxerUIPlatformModule.WindowFactory`. Each instance retains its original HuxerUIView, uses that attachment’s display rotation, and receives a window-bound channel; it never rebinds to a replacement Activity or window. The example’s thumbnail decoder remains an application-bound Java module because it does not present UI.
+
 The current Android implementation exchanges commands and snapshots through one SDK PlatformChannel. The backend subscribes to its snapshot event once during creation; Start and Retry reuse that subscription with generation checks. Three private JNI resource operations create a Surface stream, obtain its Surface, and finish it. They pass retained ExternalTexture payloads, not numeric texture handles. Each Surface request owns its texture until the producer's result callback; disposal retains outstanding cleanup independently of the C++ session facade.
 
 The initial full-frame path does not bind a ViewPort or effects. For direct camera Surfaces, the integration expects the SDK to consume the SurfaceTexture matrix into natural orientation, uses natural-orientation intrinsic dimensions, applies inverse display rotation, and reports native front mirroring. The user confirmed these preview behaviors on TAS_AN00; this does not establish compatibility with every camera device. Unexpected non-full cropping is rejected. Geometry changes invalidate the Surface request and publish a new immutable output generation. The user confirmed switching, all four orientations, mirroring, fitting, and background recovery on the tested device. Permission revocation and prolonged stress testing remain separate acceptance cases.
@@ -293,7 +297,7 @@ Perform capture session configuration, start, and stop operations on a defined s
 
 Select pixel formats according to the active SDK and rendering support on actual devices. Measure compatibility and cost for common BGRA and native YUV output. Publish accepting a CVPixelBuffer does not establish support for every format, HDR, or color attachment. SDR is the initial acceptance baseline.
 
-iOS and macOS have separate Objective-C++ implementations in `platform/ios/src/camera.mm` and `platform/macos/src/camera.mm`. They share only the public API, session orchestration, and preview drawing. The iOS factory uses the public `ios::PlatformModuleFactory` to receive its owning UIViewController; the existing Swift Package declares native framework dependencies. There is no Swift capture implementation or per-frame language bridge.
+iOS and macOS have separate Objective-C++ implementations in `platform/ios/src/camera.mm` and `platform/macos/src/camera.mm`. They share only the public API, session orchestration, and preview drawing. The iOS factory uses the public `ios::WindowPlatformModuleFactory` to receive its owning UIViewController; the existing Swift Package declares native framework dependencies. There is no Swift capture implementation or per-frame language bridge.
 
 The iOS output requests fixed portrait, unmirrored BGRA buffers from AVFoundation. PreviewOutput expresses the remaining clockwise rotation for the owning interface orientation: portrait 0°, landscape left 90°, upside-down 180°, and landscape right 270°. A transparent, noninteractive child view controller observes layout and rotation completion, reading UIWindowScene geometry or the owning controller orientation for hosts using the UIApplication lifecycle. It renders no preview content and is removed synchronously on stop. Device image checks must verify the mapping on front/back cameras and landscape-mounted iPad cameras.
 
@@ -313,14 +317,34 @@ Still capture uses the engine's preferred photo source and an in-memory JPEG sin
 
 Automated image tests check all four corners for four stream rotations, all eight EXIF orientations, EXIF precedence, and final mirroring. Optional device tests cover frame publication, JPEG capture, pending-operation stops, strict facing selection, and restart. Device removal, permission revocation during capture, multiple GPU adapters, and sustained performance still require separate validation.
 
+### Linux
+
+The backend uses single-planar V4L2 streaming capture (`VIDIOC_STREAMON` with MMAP buffers) and publishes software-converted frames through the SDK's `linux::PixelTexture`. A private serial queue drained by a short-lived worker runs start, photo, and stop operations; a separate frame-pump thread polls, dequeues, converts, and requeues buffers. Stop joins the pump before releasing buffers and finishing the texture, so publication and Finish never overlap. A pump-side device error reports once through the status callback; the session layer owns retries.
+
+Preview negotiates the largest raw frame among layouts the backend converts in software: packed 4:2:2 (YUYV, UYVY, YVYU), semi-planar 4:2:0 (NV12, NV21), and packed RGB (RGB24, BGR24, RGB32, BGR32), all emitted as Bgra8888 with straight alpha through BT.601 limited-range conversion. MJPEG never serves preview because per-frame JPEG decoding is too costly. The negotiated `S_FMT` result is authoritative for format, dimensions, and stride. Multi-planar-only devices report no usable node; sensor nodes whose formats the backend cannot convert are skipped.
+
+Facing comes from `V4L2_CID_CAMERA_ORIENTATION`, and mounting rotation from `V4L2_CID_CAMERA_SENSOR_ROTATION`; both are absent on most USB webcams, which report unknown facing. `/dev/video*` nodes are probed in numeric order, filtered by video-capture and streaming capabilities and by convertible formats. Explicit facing requests keep the strict no-fallback rule: unknown-facing devices are not substitutes.
+
+Still capture pauses the preview stream, reconfigures the same node to the largest MJPEG (or JPEG) frame, dequeues three frames to let exposure settle, then restores the preview stream. The published `PreviewOutput` keeps its texture across a photo; only the stream pauses. `CapturePreviewFrameAsync` never reconfigures anything: the serial queue arms a one-shot request, the frame pump hands over its next converted frame through a mutex-protected box, and the queue thread encodes it while the stream keeps running. gdk-pixbuf decodes the device JPEG, applies embedded EXIF orientation when present (taking precedence over the reported sensor rotation), applies final mirroring, and re-encodes at the requested quality; snapshot encoding converts the Bgra8888 frame through the same normalization. A camera without MJPEG output reports `Unavailable` for `CapturePhotoAsync` while preview and snapshots stay healthy. A photo failure stays local to its result; if the preview stream cannot be restored, the session fails. gdk-pixbuf is a PRIVATE pkg-config dependency of the Linux build (transitively present through GTK); V4L2 needs only kernel headers.
+
+Automated image tests check format selection, corner markers for every supported conversion layout, all four photo rotations with final mirroring plus EXIF precedence, and screen marker localization inside BGRx stream frames. Optional device tests cover live preview publication, JPEG capture, pending-operation stops, strict facing selection, and restart. Device removal, multi-planar devices, portal-mediated access in sandboxed hosts, and sustained performance still require separate validation.
+
+### Linux Screen Source
+
+The screen viewfinder never captures continuously: selection runs no capture loop, no timer, and reads nothing. The aperture is the only active part. Two runtime branches split on the window's GDK surface:
+
+- **X11 surfaces** get the Windows-equivalent path. The window's `ShapeBounding` is saved, the viewfinder rectangle is subtracted with `XShapeCombineRegion` (display and input passthrough included), and `CapturePhotoAsync` resolves the rectangle to root-window physical pixels (`XTranslateCoordinates` plus the drawing-content offset from `linux::NativeGeometry`, so CSD shadows do not shift the alignment), reads it with one synchronous `XGetImage` under a quiet error handler, and closes nothing because there was never a stream. Photo coordinates and preview coordinates share one resolver. **This path is compiled and exercised under XWayland but is unverified against a native X11 session**; XWayland itself refuses root reads, which surfaces as `Unavailable` rather than a crash or a wrong image.
+- **Other surfaces (Wayland)** keep the compositor-transparency aperture from `linux::SetWindowAperture`: the window CSS background is dropped, the opaque-region hint is cleared, and the scene is replayed clipped to the bands around the rectangle, so the compositor shows the desktop behind the window with no data path at all. `CapturePhotoAsync` runs an `org.freedesktop.portal.ScreenCast` handshake (CreateSession, SelectSources limited to one monitor with a hidden cursor and persistent permission, Start, OpenPipeWireRemote) on a detached worker and consumes the newest packed BGRx frame of the granted monitor through a PipeWire stream with memory buffers. Wayland exposes no window position, so the viewfinder localizes itself inside the stream: after the first frame arrives, a locator strip of `linux::MarkerColor` is painted above the viewfinder on the application thread — painting only once the stream consumes frames guarantees the repaint damage produces a frame that contains it, even on a static desktop. The exact-color bounding box of the strip yields its stream position and the measured device-pixel scale, and the photo crops `strip position + (viewfinder - strip) * scale` out of that frame before the strip is cleared. The first capture in a process may show the compositor's source picker; a returned restore token is replayed for later captures in the same process, and a stale token triggers one clean retry. PipeWire is an optional pkg-config dependency guarded by `HUXERUI_HAVE_PIPEWIRE`; without it, or when the user declines the share dialog, the branch reports `Unavailable`. A local GNOME Shell extension that exposes window rectangles (and optionally region reads) over D-Bus remains a possible future branch for a dialog-free photo path; the session API needs no changes for it.
+
+Aperture updates are event-driven: only anchor layout changes and window geometry changes touch the shape or the transparency, so idle selection costs nothing.
+
 ### Other Platforms
 
 | Platform | Future integration direction | Separate validation required |
 | --- | --- | --- |
-| Linux | Choose `GdkTexture`, `GlTexture`, or `PixelTexture` according to capture output | Actual capture API, DMA-BUF synchronization, drivers, destruction thread |
 | Web | Adapt captured frames to VideoFrame and publish through `VideoFrameTexture` | Browser support, the relationship between permission requests and media acquisition, main-thread constraints |
 
-Linux and Web remain future directions, with buildable implementations that report Unavailable.
+Web remains a future direction, with a buildable implementation that reports Unavailable.
 
 Web authorization may be tied to acquiring a media stream. Do not assume an independent CheckPermission call resolves that relationship. Verify the SDK permission contract against actual browser behavior before implementing Web support. At this stage, do not add a second permission API or a hidden DOM preview backend.
 
@@ -346,6 +370,8 @@ The module and application shell configure the Android manifest, Apple usage des
 ## Threads, Cancellation, and Backpressure
 
 The UI thread owns observable Session state, desired configuration, and lifecycle decisions. Platform queues own native device operations. Texture publication follows the threading constraints of the corresponding SDK type.
+
+Photo Tasks use `AwaitCallback<CameraResult<ImageAsset>>` and an SDK `CallbackCompletion` rather than occupying a worker thread while waiting for native capture. Admission runs lazily on the owning UI thread. Native callbacks post state changes through the session TaskScope; interruption completes the caller once while retaining the busy slot until native cleanup. Canceling a caller suppresses delivery without canceling native cleanup.
 
 Allocate an internal, monotonically increasing generation identifier for each startup or output rebuild. Callbacks validate the generation and closed state before publishing output or posting UI updates. This identifier isolates stale work and is not part of the public API.
 
@@ -379,6 +405,9 @@ platform/ios/Package.swift
 platform/windows/src/camera.cpp
 platform/windows/src/camera_photo.cpp
 platform/windows/src/camera_windows.h
+platform/linux/src/camera.cpp
+platform/linux/src/camera_linux.h
+platform/linux/src/camera_photo.cpp
 examples/preview/src/app.cpp
 ```
 
@@ -394,7 +423,7 @@ Start on macOS with an authorized Session lifecycle, pixel buffer publication, a
 
 Then validate Surface requests and release, all four orientations, front-camera mirroring, and source cropping on Android. Use those results to establish whether PreviewOutput geometry covers actual output. Do not freeze the public geometry interface before Android validation is complete.
 
-The independent iOS integration is complete. JPEG photo capture is implemented on Android, iOS, macOS, and Windows; complete physical-device acceptance for this path before expanding to recording, analysis, or additional platforms.
+The independent iOS integration is complete. JPEG photo capture is implemented on Android, iOS, macOS, Windows, and Linux; complete physical-device acceptance for this path before expanding to recording, analysis, or additional platforms.
 
 ### Required Validation
 

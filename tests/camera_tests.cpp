@@ -1,5 +1,4 @@
 #include <huxerui/huxerui.h>
-#include <huxerui/platform_adapter.h>
 
 #include <array>
 #include <cmath>
@@ -16,6 +15,7 @@
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -79,31 +79,17 @@ void TestGeometry() {
   Check(!camera::detail::PlacePreview(source, output, {}, {}, source), "Non-finite geometry must not draw.");
 }
 
-class TestPlatform final : public PlatformAdapter {
+class TestRuntime final : public Runtime {
 public:
-  TestPlatform()
-      : PlatformAdapter([this](std::function<void()> work) {
+  explicit TestRuntime(const Application& application)
+      : Runtime([this](std::function<void()> work) {
           std::lock_guard lock(mutex);
           pending.push_back(std::move(work));
-        }) {}
-  void RequestFrameAt(double) override {}
-  double Now() const noexcept override { return 0.0; }
-  FontMetrics Metrics(const Font&) override { return {}; }
-  TextRunMetrics MeasureRun(std::string_view, const TextStyle&, const TextShapingOptions&) override { return {}; }
-  TextLayoutMetrics MeasureText(const AttributedText&, const TextStyle&, float, const TextLayoutOptions&) override {
-    return {};
+        }) {
+    InitializeApplication(application, LaunchActivation{}, ApplicationLifecycleState::Active);
   }
-  void Drain(Runtime& runtime) {
-    for (int turns = 0; turns < 30; ++turns) {
-      while (RunOne()) {
-      }
-      runtime.BuildFrame();
-      std::lock_guard lock(mutex);
-      if (pending.empty())
-        return;
-    }
-    throw std::runtime_error("UI dispatch did not settle.");
-  }
+  ~TestRuntime() override { Retire(); }
+  void OnRuntimeStopped() override {}
 
   bool RunOne() {
     std::function<void()> work;
@@ -118,7 +104,41 @@ public:
     return true;
   }
 
-  void Await(Runtime& runtime, const std::function<bool()>& done) {
+  bool Empty() {
+    std::lock_guard lock(mutex);
+    return pending.empty();
+  }
+
+private:
+  std::mutex mutex;
+  std::deque<std::function<void()>> pending;
+};
+
+class TestPlatform final : public UiWindow {
+public:
+  TestPlatform(TestRuntime& runtime, const Application& application) : runtime_(runtime) {
+    InitializeWindow(runtime, application.root_factory, application.options.window);
+  }
+  ~TestPlatform() override { Retire(); }
+  void RequestFrameAt(double) override {}
+  double Now() const noexcept override { return 0.0; }
+  FontMetrics Metrics(const Font&) override { return {}; }
+  TextRunMetrics MeasureRun(std::string_view, const TextStyle&, const TextShapingOptions&) override { return {}; }
+  TextLayoutMetrics MeasureText(const AttributedText&, const TextStyle&, float, const TextLayoutOptions&) override {
+    return {};
+  }
+  void Drain(UiWindow& window) {
+    for (int turns = 0; turns < 30; ++turns) {
+      while (runtime_.RunOne()) {
+      }
+      window.BuildFrame();
+      if (runtime_.Empty())
+        return;
+    }
+    throw std::runtime_error("UI dispatch did not settle.");
+  }
+
+  void Await(UiWindow& runtime, const std::function<bool()>& done) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (!done() && std::chrono::steady_clock::now() < deadline) {
       Drain(runtime);
@@ -127,8 +147,8 @@ public:
     Check(done(), "Asynchronous photo operation did not complete.");
   }
 
-  std::mutex mutex;
-  std::deque<std::function<void()>> pending;
+private:
+  TestRuntime& runtime_;
 };
 
 class TestBackend final : public camera::detail::CameraBackend {
@@ -166,10 +186,10 @@ View TestRoot() {
 }
 
 void TestSessionLifetime() {
-  Application application(TestRoot, {.show_debug_overlay = false, .root_hooks = {
-    [](RootContext& root) {
+  Application application(TestRoot, {.show_debug_overlay = false, .application_hooks = {
+    [](ApplicationContext& root) {
       root.RegisterPlatformModule<std::shared_ptr<camera::detail::CameraBackend>>(
-          camera::detail::camera_module_name, [](PlatformAdapter&) -> std::shared_ptr<camera::detail::CameraBackend> {
+          camera::detail::camera_module_name, [](UiWindow&) -> std::shared_ptr<camera::detail::CameraBackend> {
             auto backend = std::make_shared<TestBackend>();
             backends.push_back(backend);
             return backend;
@@ -177,9 +197,10 @@ void TestSessionLifetime() {
       );
     },
   }});
-  TestPlatform platform;
+  TestRuntime application_runtime(application);
   {
-    Runtime runtime(application, platform);
+    TestPlatform platform(application_runtime, application);
+    UiWindow& runtime = platform;
     runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
     runtime.BuildFrame();
     platform.Drain(runtime);
@@ -219,12 +240,52 @@ void TestSessionLifetime() {
   retained_session.reset();
 }
 
+std::vector<CameraSession> isolated_sessions;
+
+View IsolatedWindowContent() {
+  auto session = UseCamera({.active = false});
+  Lifecycle([session] {
+    isolated_sessions.push_back(session);
+    return [] {};
+  });
+  return CameraPreview(session);
+}
+
+void TestWindowIsolation() {
+  std::vector<UiWindow*> hosts;
+  const Application application(IsolatedWindowContent, {
+      .show_debug_overlay = false,
+      .application_hooks = {[&hosts](ApplicationContext& context) {
+        context.RegisterPlatformModule<std::shared_ptr<camera::detail::CameraBackend>>(
+            camera::detail::camera_module_name, [&hosts](UiWindow& window) {
+              hosts.push_back(&window);
+              return std::shared_ptr<camera::detail::CameraBackend>(std::make_shared<TestBackend>());
+            });
+      }},
+  });
+  TestRuntime runtime(application);
+  auto first = std::make_unique<TestPlatform>(runtime, application);
+  auto second = std::make_unique<TestPlatform>(runtime, application);
+  first->Drain(*first);
+  second->Drain(*second);
+  Check(isolated_sessions.size() == 2 && hosts.size() == 2, "Each window must create its own camera session.");
+  Check(hosts[0] == first.get() && hosts[1] == second.get(), "Camera factories must receive their original window.");
+  second.reset();
+  first->Drain(*first);
+  Check(isolated_sessions[0].Status().state == SessionState::Stopped, "Closing a peer must not close this session.");
+  Check(isolated_sessions[1].Status().state == SessionState::Closed, "Closing a window must close its camera session.");
+  first.reset();
+  Check(isolated_sessions[0].Status().state == SessionState::Closed, "Retained sessions must not outlive their window.");
+  isolated_sessions.clear();
+}
+
 class PhotoBackend final : public camera::detail::CameraBackend {
 public:
   std::function<void(camera::CameraResult<ImageAsset>)> pending;
   std::function<void()> stopped;
   camera::PhotoOptions options;
   int captures = 0;
+  bool synchronous_failure = false;
 
   void Start(std::optional<camera::Facing>, std::function<void(camera::CameraStatus)>) override {}
   void Stop(std::function<void()> completed) override { stopped = std::move(completed); }
@@ -233,6 +294,9 @@ public:
     ++captures;
     options = value;
     pending = std::move(completed);
+    if (synchronous_failure) {
+      Complete(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Synchronous native failure."}));
+    }
   }
   void Complete(camera::CameraResult<ImageAsset> result) {
     auto completed = std::exchange(pending, {});
@@ -279,12 +343,15 @@ class PhotoTestFixture {
 public:
   PhotoTestContext context;
   Application application;
+  TestRuntime application_runtime;
   TestPlatform platform;
-  Runtime runtime;
+  UiWindow& runtime;
 
   explicit PhotoTestFixture(Facing facing = Facing::Front)
       : application(PhotoTestRoot, {.show_debug_overlay = false}),
-        runtime(application, platform) {
+        application_runtime(application),
+        platform(application_runtime, application),
+        runtime(platform) {
     Check(!active_photo_test, "Photo fixtures must not overlap.");
     active_photo_test = &context;
     context.facing = facing;
@@ -307,6 +374,25 @@ public:
 };
 
 void TestPhotoRequests() {
+  {
+    PhotoTestFixture fixture;
+    std::optional<CameraResult<ImageAsset>> result;
+    auto task = fixture.Launch(result);
+    task.Cancel();
+    fixture.Drain();
+    Check(!result && fixture.context.backend->captures == 0,
+          "Cancellation before lazy startup must not start native capture.");
+    Check(!fixture.context.owner->status->capturing_photo, "Canceled startup must not reserve the capture slot.");
+  }
+  {
+    PhotoTestFixture fixture;
+    fixture.context.backend->synchronous_failure = true;
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result);
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::CaptureFailed, "Synchronous native errors must complete the Task.");
+    Check(!fixture.context.owner->status->capturing_photo, "Synchronous completion must release the capture slot.");
+  }
   {
     PhotoTestFixture fixture;
     const auto& owner = fixture.context.owner;
@@ -432,6 +518,7 @@ int main() {
   try {
     TestGeometry();
     TestSessionLifetime();
+    TestWindowIsolation();
     TestPhotoRequests();
     std::cout << "Camera geometry, session lifetime, and photo request tests passed.\n";
     return 0;

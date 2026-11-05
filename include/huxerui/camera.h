@@ -250,6 +250,23 @@ public:
   /// @endcode
   [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 
+  /// Captures a JPEG of the newest frame the live preview is showing, without changing the capture mode.
+  /// Start from a UI event or Task, not during composition. The lazy task checks readiness when it runs.
+  /// The snapshot reflects what the preview currently displays: backends take the newest preview frame where
+  /// possible and fall back to the native still-photo output otherwise, so resolution follows the preview
+  /// stream rather than a separate photo negotiation. Preview mirroring options do not affect the result;
+  /// PhotoOptions controls it exactly as for CapturePhotoAsync.
+  /// Only one photo-style request is accepted at a time; additional requests return OperationInProgress
+  /// without queuing. Stopping, switching, backgrounding, or session failure ends a pending request with
+  /// Interrupted. An individual snapshot error does not set CameraStatus::error or stop the preview.
+  /// @param options JPEG quality and final mirroring for this request only.
+  /// @return A task yielding an owned JPEG image or CameraError.
+  /// @throws std::invalid_argument Before returning a task if quality or mirror mode is invalid.
+  /// @code
+  /// auto result = co_await session.CapturePreviewFrameAsync({.jpeg_quality = 90});
+  /// @endcode
+  [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePreviewFrameAsync(PhotoOptions options = {}) const;
+
 private:
   explicit CameraSession(std::shared_ptr<detail::CameraSessionData> data);
   std::shared_ptr<detail::CameraSessionData> data_;

@@ -25,6 +25,11 @@ public:
     completed(CameraResult<ImageAsset>::Failure(
         {CameraErrorCode::Unavailable, "Still-photo capture is unavailable on this camera."}));
   }
+  /// Delivers one JPEG of the newest live preview frame without changing the capture mode.
+  /// Backends whose still output is already immediate may delegate to CapturePhoto.
+  virtual void CapturePreviewFrame(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) {
+    CapturePhoto(std::move(options), std::move(completed));
+  }
 };
 
 void InstallPlatformCamera(ApplicationContext& root);

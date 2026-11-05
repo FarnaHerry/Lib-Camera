@@ -1,6 +1,8 @@
 #include "camera_internal.h"
 
-#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(_WIN32)
+// Linux ships the V4L2 backend under platform/linux; the placeholder only covers
+// platforms without a real capture implementation.
+#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(_WIN32) && !defined(__linux__)
 namespace huxerui::camera::detail {
 namespace {
 

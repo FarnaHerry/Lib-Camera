@@ -55,6 +55,7 @@ const char* StateName(camera::SessionState state) {
     case camera::SessionState::Failed: return "UNAVAILABLE";
     case camera::SessionState::Closed: return "CLOSED";
   }
+  return "UNKNOWN";
 }
 
 const char* FacingName(std::optional<camera::Facing> facing) {
@@ -369,6 +370,19 @@ View CameraWorkspace() {
       }
     });
   };
+  auto snapshot_frame = [session, tasks, photo, photo_error] {
+    if (session.Status().capturing_photo) return;
+    photo_error = std::string{};
+    tasks.Launch([session, photo, photo_error]() -> Task<void> {
+      try {
+        auto result = co_await session.CapturePreviewFrameAsync();
+        if (result.Succeeded()) photo = std::move(result).Value();
+        else photo_error = result.Error().message;
+      } catch (const std::exception& error) {
+        photo_error = std::string(error.what());
+      }
+    });
+  };
   auto show_photo = [sheets, photo, tasks, saving_photo, sheet_presented] {
     const auto image = photo.Get();
     if (!image.HasValue()) return;
@@ -454,6 +468,8 @@ View CameraWorkspace() {
           : active.Get() ? "Stop camera" : "Start camera")
           .OnClick([live, take_photo, toggle_camera] { if (live) take_photo(); else toggle_camera(); })
           .With(Grow(), Enabled(!authorizing.Get() && !stopping && !status.capturing_photo)),
+      live ? View(IconButton(app::images::camera, "Capture the current frame").OnClick(snapshot_frame)
+          .With(Enabled(!status.capturing_photo), Background(control_background), CornerRadius(14.0F))) : View(),
       live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
           .With(Background(control_background), CornerRadius(14.0F))) : View(),
       expanded || screen_mode ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)

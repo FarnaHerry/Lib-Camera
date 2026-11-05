@@ -49,6 +49,7 @@ if (NOT TARGET HuxerUI::huxerui)
     elseif (HUXERUI_HOME)
         find_package(HuxerUI CONFIG REQUIRED
                 PATHS "${HUXERUI_HOME}"
+                PATH_SUFFIXES lib/cmake/HuxerUI lib64/cmake/HuxerUI
                 NO_DEFAULT_PATH
                 NO_CMAKE_FIND_ROOT_PATH
         )
