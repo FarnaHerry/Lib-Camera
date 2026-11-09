@@ -10,6 +10,8 @@
 #include <chrono>
 #include <mutex>
 
+#define CAMERA_DISCARD(expression) static_cast<void>(expression)
+
 using namespace huxerui;
 
 namespace {
@@ -81,10 +83,12 @@ View StatusBadge(camera::SessionState state) {
 [[huxerui::composable]]
 View CameraSettings(State<std::optional<camera::Facing>> facing, State<ImageFit> fit,
                     State<camera::MirrorMode> mirror, State<bool> grid, State<bool> comparison) {
-  const auto selected_facing = facing.Get();
+  const std::optional<camera::Facing> selected_facing = facing;
+  const ImageFit selected_fit = fit;
+  const camera::MirrorMode selected_mirror = mirror;
   const std::size_t facing_index = !selected_facing ? 0 : *selected_facing == camera::Facing::Front ? 1 : 2;
-  const std::size_t mirror_index = mirror.Get() == camera::MirrorMode::Auto ? 0
-      : mirror.Get() == camera::MirrorMode::Off ? 1 : 2;
+  const std::size_t mirror_index = selected_mirror == camera::MirrorMode::Auto ? 0
+      : selected_mirror == camera::MirrorMode::Off ? 1 : 2;
   return Column {
     Column {
       Label("Camera source", 13.0F, foreground, FontWeight::Medium),
@@ -95,7 +99,7 @@ View CameraSettings(State<std::optional<camera::Facing>> facing, State<ImageFit>
     }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     Column {
       Label("Frame fit", 13.0F, foreground, FontWeight::Medium),
-      SegmentedButton({"Fill", "Fit"}, fit.Get() == ImageFit::Cover ? 0 : 1)
+      SegmentedButton({"Fill", "Fit"}, selected_fit == ImageFit::Cover ? 0 : 1)
           .OnChanged([fit](std::size_t index) { fit = index == 0 ? ImageFit::Cover : ImageFit::Contain; }),
       Label("Fill crops to the viewfinder. Fit shows the full frame.", 12.0F),
     }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
@@ -186,7 +190,7 @@ public:
           }
           completed(std::move(thumbnail), {});
         });
-    return [channel = channel_, request] { (void)channel.Cancel(request); };
+    return [channel = channel_, request] { channel.Cancel(request); };
   }
 
 private:
@@ -197,20 +201,21 @@ private:
 #if defined(__ANDROID__)
 [[huxerui::composable]]
 View PhotoImage(ImageAsset photo) {
-  auto thumbnails = UseService<PhotoThumbnail>();
   auto image = UseState(ImageAsset{});
   auto error = UseState(std::string{});
-  Lifecycle([thumbnails, photo, image, error] {
+  Lifecycle([photo, image, error] {
     image = ImageAsset{};
     error = std::string{};
-    return thumbnails->Load(photo, [image, error](ImageAsset thumbnail, std::string failure) {
+    auto thumbnails = OpenPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail");
+    auto cancel = thumbnails->Load(photo, [image, error](ImageAsset thumbnail, std::string failure) {
       image = std::move(thumbnail);
       error = std::move(failure);
     });
+    return [thumbnails, cancel = std::move(cancel)] { cancel(); };
   }, photo);
-  if (!image.Get().HasValue()) {
+  if (!image->HasValue()) {
     return Column {
-      error.Get().empty() ? View(ProgressCircle()) : View(Label(error.Get(), 12.0F).Align(TextAlign::Center)),
+      error->empty() ? View(ProgressCircle()) : View(Label(error.Get(), 12.0F).Align(TextAlign::Center)),
     }.With(MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center));
   }
   return Image(image.Get()).Fit(ImageFit::Contain);
@@ -227,7 +232,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
   auto picker = UseService<FilePicker>();
   auto message = UseState(std::string{});
   auto save = [tasks, application, picker, photo, saving, message] {
-    if (saving.Get()) return;
+    if (saving) return;
     saving = true;
     message = std::string{};
     tasks.Launch([application, picker, photo, saving, message]() -> Task<void> {
@@ -240,7 +245,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
         const bool prepared = co_await RunWorker([directory] {
           static std::once_flag cleanup;
           // Sweep previous runs only once so another window cannot delete an active export.
-          std::call_once(cleanup, [&] { (void)directory.DeleteRecursively(); });
+          std::call_once(cleanup, [&] { CAMERA_DISCARD(directory.DeleteRecursively()); });
           return directory.CreateDirectories();
         });
         const auto encoded = photo.EncodedBytes();
@@ -257,7 +262,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
       } catch (const std::exception& error) {
         message = std::string(error.what());
       }
-      (void)co_await temporary.DeleteAsync();
+      co_await temporary.DeleteAsync();
       saving = false;
     });
   };
@@ -270,8 +275,8 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
     PhotoImage(photo)
         .With(Frame{.height = 280.0F}, Background(Color::Black()), CornerRadius(16.0F), ClipChildren()),
     Label(std::to_string(photo.PixelWidth()) + " × " + std::to_string(photo.PixelHeight()) + " · JPEG", 12.0F),
-    Button(saving.Get() ? "Saving photo" : "Save photo").OnClick(save)
-        .With(Enabled(!saving.Get() && picker->CanSaveFiles())),
+    Button(saving ? "Saving photo" : "Save photo").OnClick(save)
+        .With(Enabled(!saving && picker->CanSaveFiles())),
     Label(!picker->CanSaveFiles() ? "File export is unavailable on this device." : message.Get(), 12.0F),
   }.With(Padding(20.0F), Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch)))
       .With(Frame{.max_height = 560.0F});
@@ -301,10 +306,11 @@ View CameraWorkspace() {
   auto application = UseApplication();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
-  auto session = camera::UseCamera({.facing = facing.Get(), .active = active.Get(), .source = source.Get()});
+  auto session = camera::UseCamera({.facing = facing, .active = active, .source = source});
   const auto status = session.Status();
+  const ImageFit selected_fit = fit;
   const bool expanded = UseViewportClass() == ViewportClass::Expanded;
-  const bool screen_mode = source.Get() == camera::CaptureSource::Screen;
+  const bool screen_mode = source == camera::CaptureSource::Screen;
   const bool live = status.state == camera::SessionState::Running && (screen_mode || status.preview.has_value());
   const bool failed = status.state == camera::SessionState::Failed;
   const bool stopping = status.state == camera::SessionState::Stopping;
@@ -324,13 +330,13 @@ View CameraWorkspace() {
   };
 
   auto toggle_camera = [active, source, authorizing, permission_error, application, tasks, session, failed] {
-    if (active.Get() && !failed) {
+    if (active && !failed) {
       active = false;
       return;
     }
-    if (source.Get() == camera::CaptureSource::Screen) {
+    if (source == camera::CaptureSource::Screen) {
       permission_error = std::string{};
-      if (active.Get()) session.Retry();
+      if (active) session.Retry();
       else active = true;
       return;
     }
@@ -343,7 +349,7 @@ View CameraWorkspace() {
           permission = co_await application.RequestPermissionAsync(Permission::Camera);
         }
         if (permission == PermissionStatus::Granted) {
-          if (active.Get()) session.Retry();
+          if (active) session.Retry();
           else active = true;
         } else {
           active = false;
@@ -384,7 +390,7 @@ View CameraWorkspace() {
     });
   };
   auto show_photo = [sheets, photo, tasks, saving_photo, sheet_presented] {
-    const auto image = photo.Get();
+    const ImageAsset image = photo;
     if (!image.HasValue()) return;
     sheet_presented = true;
     sheets.Show([image, tasks, saving_photo, sheet_presented](BottomSheetContext sheet) {
@@ -393,19 +399,19 @@ View CameraWorkspace() {
   };
 
   View viewfinder = Stack {
-    camera::CameraPreview(session, {.fit = fit.Get(), .mirror = mirror.Get()}).Key("main-preview"),
-    live ? View() : EmptyPreview(status, authorizing.Get(), permission_error.Get()),
-    live && grid.Get() ? CompositionGrid() : View(),
+    camera::CameraPreview(session, {.fit = selected_fit, .mirror = mirror}).Key("main-preview"),
+    live ? View() : EmptyPreview(status, authorizing, permission_error),
+    live && grid ? CompositionGrid() : View(),
     Column {
       Row {
         StatusBadge(status.state),
         Spacer(),
-        Label(source.Get() == camera::CaptureSource::Screen ? "SCREEN" : "PREVIEW",
+        Label(source == camera::CaptureSource::Screen ? "SCREEN" : "PREVIEW",
               10.0F, foreground, FontWeight::SemiBold)
             .With(Padding(8.0F), Background(Color::Rgb(15, 18, 22, 0.88F)), CornerRadius(8.0F)),
       }.With(CrossAlign(CrossAxisAlignment::Center)),
       Spacer(),
-      live && comparison.Get() ? View(Row {
+      live && comparison ? View(Row {
         Spacer(),
         Column {
           camera::CameraPreview(session, {.fit = ImageFit::Contain, .mirror = camera::MirrorMode::Off})
@@ -425,7 +431,7 @@ View CameraWorkspace() {
 
   if (screen_mode) {
     viewfinder = Column {
-      (sheet_presented.Get() ? View(Spacer()) : camera::ScreenPreview(session)).With(Grow()),
+      (sheet_presented ? View(Spacer()) : camera::ScreenPreview(session)).With(Grow()),
     }.With(
         Grow(),
         Padding(2.0F),
@@ -437,7 +443,7 @@ View CameraWorkspace() {
   }
 
   View controls = Column {
-    SegmentedButton({"Camera", "Screen"}, source.Get() == camera::CaptureSource::Camera ? 0 : 1)
+    SegmentedButton({"Camera", "Screen"}, source == camera::CaptureSource::Camera ? 0 : 1)
         .OnChanged([source, active, permission_error](std::size_t index) {
           active = false;
           permission_error = std::string{};
@@ -445,29 +451,29 @@ View CameraWorkspace() {
         }),
     Row {
       Column {
-        Label(source.Get() == camera::CaptureSource::Screen ? "Desktop beneath viewfinder"
+        Label(source == camera::CaptureSource::Screen ? "Desktop beneath viewfinder"
               : FacingName(status.actual_facing ? status.actual_facing : facing.Get()),
               14.0F, foreground, FontWeight::Medium),
         Label(screen_mode ? "Transparent viewfinder · capture on demand"
-              : fit.Get() == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
+              : selected_fit == ImageFit::Cover ? "Fill frame" : "Fit frame", 12.0F),
       }.With(Spacing(4.0F)),
       Spacer(),
       screen_mode ? StatusBadge(status.state) : View(),
       IconButton(app::images::photo, "View last photo").OnClick(show_photo)
-          .With(Enabled(photo.Get().HasValue()), Background(control_background), CornerRadius(14.0F)),
+          .With(Enabled(photo->HasValue()), Background(control_background), CornerRadius(14.0F)),
     }.With(CrossAlign(CrossAxisAlignment::Center)),
     Row {
       IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, status] {
         const auto current = status.actual_facing ? status.actual_facing : facing.Get();
         facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
-      }).With(Enabled(source.Get() == camera::CaptureSource::Camera && !authorizing.Get() && !stopping),
+      }).With(Enabled(source == camera::CaptureSource::Camera && !authorizing && !stopping),
               Background(control_background), CornerRadius(14.0F)),
-      Button(authorizing.Get() ? "Requesting access" : stopping ? "Stopping camera"
+      Button(authorizing ? "Requesting access" : stopping ? "Stopping camera"
           : status.capturing_photo ? "Taking photo" : live ? "Take photo"
-          : failed || !permission_error.Get().empty() ? "Try again"
-          : active.Get() ? "Stop camera" : "Start camera")
+          : failed || !permission_error->empty() ? "Try again"
+          : active ? "Stop camera" : "Start camera")
           .OnClick([live, take_photo, toggle_camera] { if (live) take_photo(); else toggle_camera(); })
-          .With(Grow(), Enabled(!authorizing.Get() && !stopping && !status.capturing_photo)),
+          .With(Grow(), Enabled(!authorizing && !stopping && !status.capturing_photo)),
       live ? View(IconButton(app::images::camera, "Capture the current frame").OnClick(snapshot_frame)
           .With(Enabled(!status.capturing_photo), Background(control_background), CornerRadius(14.0F))) : View(),
       live ? View(IconButton(app::images::stop, "Stop camera").OnClick([active] { active = false; })
@@ -475,7 +481,7 @@ View CameraWorkspace() {
       expanded || screen_mode ? View() : View(IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
           .With(Background(control_background), CornerRadius(14.0F))),
     }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
-    photo_error.Get().empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
+    photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
   }.With(Spacing(18.0F), Padding(EdgeInsets::Symmetric(4.0F, 8.0F)), CrossAlign(CrossAxisAlignment::Stretch));
 
   View preview = Column {
@@ -583,14 +589,13 @@ const Application application{
         .application_hooks = {
             huxerui::camera::Install,
 #if defined(__ANDROID__)
-            [](ApplicationContext& root) {
+            [](ApplicationContext& context) {
               android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;
               factory.class_name = "org.huxerui.lib.camera.preview.PhotoThumbnailModule";
               factory.create = [](PlatformChannel channel) {
                 return std::make_shared<PhotoThumbnail>(std::move(channel));
               };
-              root.RegisterPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail", std::move(factory));
-              root.Provide(root.OpenPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail"));
+              context.RegisterPlatformModule<std::shared_ptr<PhotoThumbnail>>("example/photo-thumbnail", std::move(factory));
             },
 #endif
         },

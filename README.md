@@ -132,18 +132,18 @@ View PhotoCapture(camera::CameraSession session, State<ImageAsset> photo) {
         }
       });
     }).With(Enabled(status.state == camera::SessionState::Running && !status.capturing_photo)),
-    Text(message.Get()),
+    Text(message),
   };
 }
 ```
 
-The result is an upright JPEG whose resolution is selected by the native camera output. Preview size, fitting, and cropping do not affect the photo. Photo mirroring is independent of preview mirroring and defaults to `Off`. JPEG quality defaults to 90 and must be between 1 and 100; invalid options throw `std::invalid_argument` before returning the task.
+The result is an upright JPEG whose resolution is selected by the platform camera output. Preview size, fitting, and cropping do not affect the photo. Photo mirroring is independent of preview mirroring and defaults to `Off`. JPEG quality defaults to 90 and must be between 1 and 100; invalid options throw `std::invalid_argument` before returning the task.
 
 `CapturePreviewFrameAsync` accepts the same options and returns a JPEG of the frame the live preview is currently showing. It never changes the capture mode: where the backend can take the newest preview frame directly it does, and it otherwise falls back to the native still-photo output, so resolution follows the preview stream. Use it for an immediate what-you-see-is-what-you-get snapshot; use `CapturePhotoAsync` when the native photo resolution matters. Both share the one-request-at-a-time rule and the same interruption behavior.
 
 Keep the original `ImageAsset` for saving. For photo review on Android, decode a separate thumbnail before displaying it: constraining an `Image` view's layout does not reduce the original bitmap's decoded dimensions. The [example](examples/preview/src/app.cpp) displays a thumbnail with a maximum edge of 2048 pixels while preserving the original JPEG for export.
 
-Only one photo request can be in progress per session. Additional requests return `OperationInProgress`; a session that is not ready returns `NotReady`. `capturing_photo` stays true until native processing finishes, including after the caller cancels waiting. Stopping, switching cameras, backgrounding, or session failure interrupts a pending photo with `Interrupted`.
+Only one photo request can be in progress per session. Additional requests return `OperationInProgress`; a session that is not ready returns `NotReady`. `capturing_photo` stays true until platform processing finishes, including after the caller cancels waiting. Stopping, switching cameras, backgrounding, or session failure interrupts a pending photo with `Interrupted`.
 
 A photo failure does not stop an otherwise healthy preview. A captured `ImageAsset` remains usable after the session closes. Devices that cannot provide still-photo output report `Unavailable` for photo requests. Video recording, RAW, HDR, maximum sensor resolution, and metadata preservation are outside the current API's guarantees.
 
@@ -177,7 +177,7 @@ Task<bool> ExportPhoto(ImageAsset photo, File prepared_file, std::shared_ptr<Fil
 
 Obtain the picker with `UseService<FilePicker>()` during composition and pass a unique temporary file as `prepared_file`. The task returns false when saving is unavailable, dismissed, or unsuccessful. File operations use SDK file results rather than `CameraError`.
 
-Your application owns temporary-file cleanup. Keep the file available until writing and native export finish; canceling the caller does not make it safe to delete immediately. The example keeps saving in the camera page's task scope so dismissing photo review does not cancel the export. Saving directly to the system photo library is not provided by this module.
+Your application owns temporary-file cleanup. Keep the file available until writing and platform export finish; canceling the caller does not make it safe to delete immediately. The example keeps saving in the camera page's task scope so dismissing photo review does not cancel the export. Saving directly to the system photo library is not provided by this module.
 
 ## Run the Example
 
@@ -194,7 +194,7 @@ Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use 
 
 Select **Start camera** to authorize and start the preview, then **Take photo** to capture. The camera icon snapshots the frame the preview is currently showing. The photo icon opens the latest photo and its **Save photo** action. Use the adjacent controls to stop capture, switch cameras, or open preview settings. A failed session offers **Try again**.
 
-On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the native photo output and WIC to normalize orientation and JPEG quality.
+On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 
 On Linux, the camera backend uses V4L2 streaming capture and publishes converted frames through a software `PixelTexture`. Preview negotiates the largest raw format the device offers among packed 4:2:2, 4:2:0, and packed RGB layouts; MJPEG serves still photos at the largest MJPEG frame, decoded and re-encoded through gdk-pixbuf (an automatic dependency on Linux). `CapturePreviewFrameAsync` takes the newest converted preview frame without pausing the stream. Facing and mounting rotation come from the optional `V4L2_CID_CAMERA_ORIENTATION` and `V4L2_CID_CAMERA_SENSOR_ROTATION` controls, so most USB webcams report unknown facing. A camera that exposes no MJPEG still output reports `Unavailable` for `CapturePhotoAsync` while `CapturePreviewFrameAsync` and preview stay healthy. Single-planar capture only: multi-planar devices need a driver that also exposes a single-planar node.
 

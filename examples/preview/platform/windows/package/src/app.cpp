@@ -103,7 +103,7 @@ View SecondaryAction(View action, const ThemeSpec& theme) {
       .padding = EdgeInsets::Symmetric(20.0F, 8.0F),
       .minimum_width = 72.0F,
       .minimum_height = 40.0F,
-      .corner_radius = theme.shapes.full,
+      .corner_radii = CornerRadii{theme.shapes.full},
       .indication = theme.interactions.indication,
   });
   return Theme {std::move(definition), std::move(action)};
@@ -214,13 +214,13 @@ View InstallerContent() {
             .With(Frame{.min_width = 112.0F})
     );
   } else if (status.phase == InstallerPhase::Ready && status.product == InstallerProductState::Absent) {
-    const TextEditingValue destination_value = destination.Get().value_or(
+    const TextEditingValue destination_value = destination->value_or(
         TextEditingValue::FromText(InstallPathText(status.default_destination))
     );
     const std::optional<std::filesystem::path> destination_path = ParseInstallPath(destination_value.text);
     const std::filesystem::path browse_initial = destination_path.value_or(status.default_destination);
     const bool create_desktop_shortcut =
-        desktop_shortcut.Get().value_or(status.default_create_desktop_shortcut);
+        desktop_shortcut->value_or(status.default_create_desktop_shortcut);
     eyebrow = installer_strings::installation;
     heading = installer_strings::ready_to_install;
     details.push_back(
@@ -395,6 +395,6 @@ const Application application{
             .minimum_size = Size{720.0F, 460.0F},
         },
         .show_debug_overlay = false,
-        .application_hooks = {InstallInstallerSession},
+        .window_hooks = {InstallInstallerSession},
     },
 };

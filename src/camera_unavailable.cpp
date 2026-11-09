@@ -22,8 +22,8 @@ public:
 
 } // namespace
 
-void InstallPlatformCamera(ApplicationContext& root) {
-  root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
+void InstallPlatformCamera(ApplicationContext& context) {
+  context.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
       camera_module_name, [](UiWindow&) -> std::shared_ptr<CameraBackend> {
         return std::make_shared<UnavailableCamera>();
       }

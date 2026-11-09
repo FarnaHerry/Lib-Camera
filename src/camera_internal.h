@@ -20,7 +20,7 @@ public:
   virtual void SetScreenRegion(std::optional<Rect>) {}
   /// Completion follows producer shutdown and texture Finish. An empty callback is allowed.
   virtual void Stop(std::function<void()> completed) = 0;
-  /// Delivers one independent, upright JPEG. Stop must wait for accepted native photo work to finish cleanup.
+  /// Delivers one independent, upright JPEG. Stop must wait for accepted platform photo work to finish cleanup.
   virtual void CapturePhoto(PhotoOptions, std::function<void(CameraResult<ImageAsset>)> completed) {
     completed(CameraResult<ImageAsset>::Failure(
         {CameraErrorCode::Unavailable, "Still-photo capture is unavailable on this camera."}));
@@ -32,7 +32,7 @@ public:
   }
 };
 
-void InstallPlatformCamera(ApplicationContext& root);
+void InstallPlatformCamera(ApplicationContext& context);
 
 struct PreviewPlacement {
   Rect source;

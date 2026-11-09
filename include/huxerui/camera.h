@@ -191,7 +191,7 @@ struct CameraStatus {
   /// Available texture and presentation geometry, or empty before output is available or after it is cleared.
   /// A suspended platform session may retain output; its presence alone does not indicate live capture.
   std::optional<PreviewOutput> preview;
-  /// Whether an accepted photo request is still pending, including native processing after caller cancellation.
+  /// Whether an accepted photo request is still pending, including platform processing after caller cancellation.
   /// Capture normally remains Running during a photo; this flag is shared by all session handles.
   bool capturing_photo = false;
 
@@ -231,11 +231,11 @@ public:
   /// Only one request is accepted at a time; additional requests return OperationInProgress without queuing.
   /// The target orientation and resolved mirror mode are fixed when the request is accepted.
   /// Success returns an independent ImageAsset with upright pixels, normal EXIF orientation, and scale 1.
-  /// Camera photo dimensions are negotiated by the native output, independently of preview layout.
+  /// Camera photo dimensions are negotiated by the capture output, independently of the preview's layout or Cover crop.
   /// Screen photo dimensions follow the ScreenPreview anchor in physical display pixels.
   /// Stopping, switching, backgrounding, or session failure ends a pending request with Interrupted.
   /// An individual photo error does not set CameraStatus::error or stop otherwise healthy preview capture.
-  /// Task cancellation suppresses delivery; native cleanup continues before another request is accepted.
+  /// Task cancellation suppresses delivery; platform cleanup continues before another request is accepted.
   /// No file or photo-library entry is created. Save EncodedBytes() with the SDK File APIs when needed.
   /// @param options JPEG quality and final mirroring for this request only.
   /// @return A task yielding an owned JPEG image or CameraError; unavailable still-photo output returns Unavailable.
@@ -248,7 +248,7 @@ public:
   ///   message = result.Error().message;
   /// }
   /// @endcode
-  [[nodiscard]] Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
+  Task<CameraResult<ImageAsset>> CapturePhotoAsync(PhotoOptions options = {}) const;
 
   /// Captures a JPEG of the newest frame the live preview is showing, without changing the capture mode.
   /// Start from a UI event or Task, not during composition. The lazy task checks readiness when it runs.
@@ -275,11 +275,11 @@ private:
   friend View ScreenPreview(CameraSession, PreviewOptions);
 };
 
-/// Installs the camera platform module for an application root.
+/// Installs the camera platform module in the application catalog.
 /// Register this function in AppOptions::application_hooks before composing content that calls UseCamera.
 /// Registration neither opens a camera nor requests authorization. Unsupported capture platforms report
 /// CameraErrorCode::Unavailable when capture is requested.
-/// @param root Application root context supplied by HuxerUI when it runs the registered hook.
+/// @param context Application context supplied by HuxerUI when it runs the registered hook.
 /// @code
 /// const huxerui::Application application{
 ///     App,
@@ -290,10 +290,10 @@ private:
 ///     }
 /// };
 /// @endcode
-void Install(ApplicationContext& root);
+void Install(ApplicationContext& context);
 
 /// Retains a camera session in the current composition and applies the requested capture intent.
-/// Call from an active composition on the UI thread, with Install registered for its root.
+/// Call from an active composition on the UI thread, with Install registered for its application.
 /// Recomposition at the same retained call site updates the existing session. Distinct calls own separate
 /// sessions; share a returned handle when multiple previews should use one device.
 ///
@@ -317,7 +317,7 @@ void Install(ApplicationContext& root);
 ///   auto active = UseState(false);
 ///   auto application = UseApplication();
 ///   auto tasks = UseTaskScope();
-///   auto session = camera::UseCamera({.active = active.Get()});
+///   auto session = camera::UseCamera({.active = active});
 ///
 ///   return Column {
 ///     camera::CameraPreview(session).With(Frame{.width = 320.0F, .height = 240.0F}),

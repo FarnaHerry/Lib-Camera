@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
+# CMake initializes Apple deployment defaults during the first project() call.
+# Explicit settings and toolchains retain ownership of their target platform.
+if (CMAKE_HOST_APPLE AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{CMAKE_TOOLCHAIN_FILE}" STREQUAL ""
+        AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment target")
+endif ()
+
 project(camera VERSION 0.1.0 LANGUAGES NONE)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -9,10 +17,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include("${CMAKE_CURRENT_SOURCE_DIR}/HuxerUIProject.cmake")
 if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
-endif ()
-
-if (HUXERUI_LIBRARY_GRAPH_ONLY)
-    enable_language(CXX)
 endif ()
 
 if (IOS AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
@@ -80,8 +84,8 @@ huxerui_add_library(huxerui_camera
 
 add_library(HuxerUI::Camera ALIAS huxerui_camera)
 
-# 打包前那趟「只出库图」的配置（HUXERUI_LIBRARY_GRAPH_ONLY=ON）里目标只是 INTERFACE 占位，
-# 不能再设 PUBLIC/PRIVATE 属性 —— 与 Lib-MediaPlayer / Lib-Live2D 同样的早退。
+# Before packaging, the graph-only configuration creates an INTERFACE placeholder target; skip
+# target properties that only apply to a real compiled library.
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()

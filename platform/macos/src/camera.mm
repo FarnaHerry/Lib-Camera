@@ -11,6 +11,8 @@
 #include "camera_macos.h"
 #include "camera_internal.h"
 
+#define CAMERA_UNUSED(name) static_cast<void>(name)
+
 using namespace huxerui;
 using namespace huxerui::camera;
 
@@ -87,6 +89,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 - (void)captureOutput:(AVCapturePhotoOutput*)output
     didFinishProcessingPhoto:(AVCapturePhoto*)photo
                        error:(NSError*)error {
+  CAMERA_UNUSED(output);
   processingError_ = error;
   data_ = error ? nil : photo.fileDataRepresentation;
 }
@@ -94,6 +97,8 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 - (void)captureOutput:(AVCapturePhotoOutput*)output
     didFinishCaptureForResolvedSettings:(AVCaptureResolvedPhotoSettings*)settings
                                   error:(NSError*)error {
+  CAMERA_UNUSED(output);
+  CAMERA_UNUSED(settings);
   NSError* failure = error ?: processingError_;
   dispatch_async(processingQueue_, ^{
     auto completed = std::exchange(completed_, {});
@@ -419,8 +424,8 @@ private:
 
 } // namespace
 
-void InstallPlatformCamera(ApplicationContext& root) {
-  root.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
+void InstallPlatformCamera(ApplicationContext& context) {
+  context.RegisterPlatformModule<std::shared_ptr<CameraBackend>>(
       camera_module_name, macos::PlatformModuleFactory<std::shared_ptr<CameraBackend>>{
           .create = [](UiWindow&, NSWindow* window) -> std::shared_ptr<CameraBackend> {
             return std::make_shared<AppleCamera>(window);
