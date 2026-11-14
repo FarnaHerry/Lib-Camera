@@ -2,37 +2,36 @@
 
 #include <array>
 #include <cmath>
-#include <deque>
 #include <iostream>
 #include <limits>
-#include <mutex>
 #include <thread>
 #include <stdexcept>
 
-#include "camera_internal.h"
-#include "camera_session.h"
+#include "camera_test_fixture.h"
 #include "photo_fixture.h"
 
 #define CAMERA_DISCARD(expression) static_cast<void>(expression)
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using namespace huxerui::camera::test;
 
 namespace {
 
-void Check(bool condition, const char* message) {
-  if (!condition) {
-    throw std::runtime_error(message);
-  }
-}
+using huxerui::Point;
+using huxerui::Rect;
+using huxerui::Size;
 
 void Near(float actual, float expected) {
   Check(std::abs(actual - expected) < 0.001F, "Unexpected preview coordinate.");
 }
 
 void TestGeometry() {
-  PreviewOutput output;
+  struct TestTexture final : ExternalTexture {
+    explicit TestTexture(Size size) : ExternalTexture(size) {}
+  };
   const Size source{400.0F, 200.0F};
+  PreviewOutput output{.texture = std::make_shared<TestTexture>(source)};
   const std::array<camera::PreviewRotation, 4> rotations{camera::PreviewRotation::R0, camera::PreviewRotation::R90, camera::PreviewRotation::R180, camera::PreviewRotation::R270};
   const std::array<Point, 4> origin{{{0.0F, 0.0F}, {200.0F, 0.0F}, {400.0F, 200.0F}, {0.0F, 400.0F}}};
   const std::array<Point, 4> top_right{{{400.0F, 0.0F}, {200.0F, 400.0F}, {0.0F, 200.0F}, {0.0F, 0.0F}}};
@@ -57,6 +56,11 @@ void TestGeometry() {
       const auto point = front->transform.Apply({0.0F, 0.0F});
       Near(point.x, already_mirrored ? origin[index].x : bounds.width - origin[index].x);
       Near(point.y, origin[index].y);
+      const auto metering = camera::detail::PreviewTexturePoint(output, {.fit = ImageFit::Contain}, Facing::Front,
+          bounds, front->transform.Apply({100.0F, 120.0F}));
+      Check(metering.has_value(), "A visible point must map to the preview texture.");
+      Near(metering->x, 0.25F);
+      Near(metering->y, 0.6F);
     }
     output.mirrored = false;
   }
@@ -65,6 +69,12 @@ void TestGeometry() {
   Near(contain->transform.Apply({0.0F, 0.0F}).y, 50.0F);
   const auto cover = camera::detail::PlacePreview(source, output, {.fit = ImageFit::Cover}, {}, {200.0F, 200.0F});
   Near(cover->transform.Apply({0.0F, 0.0F}).x, -100.0F);
+  Check(!camera::detail::PreviewTexturePoint(output, {.fit = ImageFit::Contain}, {}, {200.0F, 200.0F}, {40.0F, 20.0F}),
+        "The letterbox must not produce a metering point.");
+  const auto covered_point = camera::detail::PreviewTexturePoint(output, {.fit = ImageFit::Cover}, {},
+      {200.0F, 200.0F}, {20.0F, 100.0F});
+  Check(covered_point.has_value(), "A visible point in a cropped preview must map to the source.");
+  Near(covered_point->x, 0.3F);
   const auto fill = camera::detail::PlacePreview(source, output, {.fit = ImageFit::Fill}, {}, {200.0F, 200.0F});
   Near(fill->transform.Apply({400.0F, 200.0F}).x, 200.0F);
   Near(fill->transform.Apply({400.0F, 200.0F}).y, 200.0F);
@@ -80,84 +90,109 @@ void TestGeometry() {
   Check(!camera::detail::PlacePreview(source, output, {}, {}, source), "Non-finite geometry must not draw.");
 }
 
-class TestRuntime final : public Runtime {
-public:
-  explicit TestRuntime(const Application& application)
-      : Runtime([this](std::function<void()> work) {
-          std::lock_guard lock(mutex);
-          pending.push_back(std::move(work));
-        }) {
-    InitializeApplication(application, LaunchActivation{}, ApplicationLifecycleState::Active);
-  }
-  ~TestRuntime() override { Retire(); }
-  void OnRuntimeStopped() override {}
+void TestFrameProcessorFactory() {
+  struct TestTexture final : ExternalTexture {
+    TestTexture() : ExternalTexture({64.0F, 64.0F}) {}
+  };
+  const PreviewOutput input{.texture = std::make_shared<TestTexture>(), .rotation = PreviewRotation::R270};
+  const auto timestamp = std::chrono::seconds(1);
+  constexpr std::uint32_t width = 720;
+  constexpr std::uint32_t height = 1280;
+  std::array expected_dimensions{width, height};
+  int factory_calls = 0;
+  std::weak_ptr<int> last_instance;
+  camera::detail::FramePipeline pipeline({.frame_processor_factory = std::make_shared<const FrameProcessorFactory>(
+      [&](std::uint32_t pixel_width, std::uint32_t pixel_height) -> FrameProcessor {
+        Check(pixel_width == expected_dimensions[0] && pixel_height == expected_dimensions[1],
+              "The factory must receive the source texture's pixel dimensions.");
+        ++factory_calls;
+        auto count = std::make_shared<int>(0);
+        last_instance = count;
+        return [count = std::move(count)](const PreviewOutput& source, std::chrono::nanoseconds) {
+          auto output = source;
+          output.rotation = ++*count == 1 ? PreviewRotation::R90 : PreviewRotation::R180;
+          return CameraResult<PreviewOutput>::Success(std::move(output));
+        };
+      })});
+  camera::detail::FrameProducer first;
+  Check(factory_calls == 0, "The factory must wait for a source frame.");
+  auto output = pipeline.Process(first, input, timestamp, width, height);
+  Check(output.Succeeded() && output.Value().output.rotation == PreviewRotation::R90 && factory_calls == 1,
+        "The first frame must create and use the processor.");
+  const auto first_instance = last_instance;
+  output = pipeline.Process(first, input, timestamp, width, height);
+  Check(output.Succeeded() && output.Value().output.rotation == PreviewRotation::R180 && factory_calls == 1,
+        "Successive frames must retain the producer's processor state.");
+  camera::detail::FrameProducer next;
+  expected_dimensions = {height, width};
+  output = pipeline.Process(next, input, timestamp, height, width);
+  Check(output.Succeeded() && output.Value().output.rotation == PreviewRotation::R90 && factory_calls == 2,
+        "A new producer must get independent processor state.");
+  first.processor = {};
+  Check(first_instance.expired() && !last_instance.expired(), "Retiring one producer must release its processor.");
 
-  bool RunOne() {
-    std::function<void()> work;
-    {
-      std::lock_guard lock(mutex);
-      if (pending.empty())
-        return false;
-      work = std::move(pending.front());
-      pending.pop_front();
-    }
-    work();
-    return true;
-  }
+  camera::detail::FramePipeline empty({.frame_processor_factory =
+      std::make_shared<const FrameProcessorFactory>([](std::uint32_t, std::uint32_t) { return FrameProcessor{}; })});
+  camera::detail::FrameProducer invalid;
+  const auto missing = empty.Process(invalid, input, timestamp, width, height);
+  Check(!missing.Succeeded() && missing.Error().code == CameraErrorCode::CaptureFailed,
+        "An empty processor returned by the factory must fail capture.");
+  camera::detail::FramePipeline throwing({.frame_processor_factory = std::make_shared<const FrameProcessorFactory>(
+      [](std::uint32_t, std::uint32_t) -> FrameProcessor {
+        throw std::runtime_error("Injected factory failure.");
+      })});
+  const auto failed = throwing.Process(invalid, input, timestamp, width, height);
+  Check(!failed.Succeeded() && failed.Error().message == "Injected factory failure.",
+        "The factory failure must reach the capture error.");
+}
 
-  bool Empty() {
-    std::lock_guard lock(mutex);
-    return pending.empty();
-  }
+void TestOutputCrop() {
+  using camera::detail::CropForOutput;
+  const auto square = CropForOutput({0.125F, 0.25F, 0.75F, 0.5F}, 640, 480, 320, 320);
+  Check(square == Rect{0.3125F, 0.25F, 0.375F, 0.5F}, "Square output must center-crop the source horizontally.");
+  const auto wide = CropForOutput({-0.25F, 0.0F, 1.0F, 1.0F}, 640, 480, 640, 180);
+  Check(wide == Rect{0.0F, 0.359375F, 0.75F, 0.28125F}, "Wide output must center-crop within the clipped source.");
+}
 
-private:
-  std::mutex mutex;
-  std::deque<std::function<void()>> pending;
-};
+void TestProducerSize() {
+  using camera::detail::FramePipeline;
+  CameraOptions options{.output_pixel_width = 360, .output_pixel_height = 480};
+  FramePipeline direct(options);
+  Check(direct.ProducerSize(720, 960) == std::pair{360u, 480u},
+        "Uniform scaling can use the configured producer size.");
+  Check(direct.ProducerSize(720, 1280) == std::pair{720u, 1280u},
+        "A change in aspect ratio needs the original producer size.");
+  options.frame_processor_factory = std::make_shared<const FrameProcessorFactory>();
+  FramePipeline processed(options);
+  Check(processed.ProducerSize(720, 960) == std::pair{720u, 960u},
+        "A custom processor must receive the original producer size.");
+  FramePipeline defaults(CameraOptions{});
+  Check(defaults.ProducerSize(720, 960) == std::pair{720u, 960u},
+        "The default output must use the original producer size.");
+}
 
-class TestPlatform final : public UiWindow {
-public:
-  TestPlatform(TestRuntime& runtime, const Application& application) : runtime_(runtime) {
-    InitializeWindow(runtime, application.root_factory, application.options.window,
-                     std::nullopt, WindowLifecycleState::Active);
-  }
-  ~TestPlatform() override { Retire(); }
-  void RequestFrameAt(double) override {}
-  double Now() const noexcept override { return 0.0; }
-  FontMetrics Metrics(const Font&) override { return {}; }
-  TextRunMetrics MeasureRun(std::string_view, const TextStyle&, const TextShapingOptions&) override { return {}; }
-  TextLayoutMetrics MeasureText(const AttributedText&, const TextStyle&, float, const TextLayoutOptions&) override {
-    return {};
-  }
-  void Drain(UiWindow& window) {
-    for (int turns = 0; turns < 30; ++turns) {
-      while (runtime_.RunOne()) {
-      }
-      window.BuildFrame();
-      if (runtime_.Empty())
-        return;
-    }
-    throw std::runtime_error("UI dispatch did not settle.");
-  }
-
-  void Await(UiWindow& runtime, const std::function<bool()>& done) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
-    while (!done() && std::chrono::steady_clock::now() < deadline) {
-      Drain(runtime);
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    Check(done(), "Asynchronous photo operation did not complete.");
-  }
-
-private:
-  TestRuntime& runtime_;
-};
+void TestCaptureFormatRank() {
+  using camera::detail::CaptureFormatRank;
+  using camera::detail::CapturePreferences;
+  const CaptureFormat full_hd{1080, 1920, FrameRateRange{30, 30}};
+  const CaptureFormat hd{1280, 720, FrameRateRange{60, 60}};
+  const CapturePreferences preferred{1920, 1080, 60};
+  Check(CaptureFormatRank(preferred, full_hd) < CaptureFormatRank(preferred, hd),
+        "Capture size must take priority over frame rate, independent of orientation.");
+  const CapturePreferences fps_only{.fps = 60};
+  Check(CaptureFormatRank(fps_only, hd) < CaptureFormatRank(fps_only, full_hd),
+        "Without a size preference, frame rate must take priority.");
+  const CaptureFormat variable{1280, 720, FrameRateRange{30, 60}};
+  Check(CaptureFormatRank(fps_only, hd) < CaptureFormatRank(fps_only, variable),
+        "A fixed matching frame rate must rank ahead of a variable range.");
+}
 
 class TestBackend final : public camera::detail::CameraBackend {
 public:
   int starts = 0;
   int stops = 0;
-  void Start(std::optional<Facing>, std::function<void(CameraStatus)>) override { ++starts; }
+  void Start(std::optional<Facing>, std::optional<std::string>, camera::detail::CapturePreferences,
+             StatusCallback) override { ++starts; }
   void Stop(std::function<void()> completed) override {
     ++stops;
     if (completed) {
@@ -199,9 +234,9 @@ void TestSessionLifetime() {
       );
     },
   }});
-  TestRuntime application_runtime(application);
   {
-    TestPlatform platform(application_runtime, application);
+    TestPlatform platform;
+    platform.Start(application);
     UiWindow& runtime = platform;
     runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
     runtime.BuildFrame();
@@ -216,6 +251,24 @@ void TestSessionLifetime() {
         rejected = true;
       }
       Check(rejected, "Invalid JPEG quality must throw before a task is returned.");
+    }
+    requested = CameraOptions{.output_pixel_width = 640};
+    runtime.BuildFrame();
+    platform.Drain(runtime);
+    Check(retained_session->Status().state == SessionState::Failed &&
+              retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
+          "An incomplete output size must fail before opening capture.");
+    for (const auto& invalid : {CameraOptions{.device_id = ""},
+                                CameraOptions{.facing = Facing::Front, .device_id = "camera"},
+                                CameraOptions{.preferred_capture_pixel_height = 720},
+                                CameraOptions{.preferred_capture_fps = 0},
+                                CameraOptions{.preferred_capture_fps = std::numeric_limits<double>::infinity()}}) {
+      requested = invalid;
+      runtime.BuildFrame();
+      platform.Drain(runtime);
+      Check(retained_session->Status().state == SessionState::Failed &&
+                retained_session->Status().error->code == CameraErrorCode::ConfigurationFailed,
+            "Invalid camera options must fail before opening capture.");
     }
     requested = CameraOptions{.active = true};
     runtime.BuildFrame();
@@ -242,8 +295,69 @@ void TestSessionLifetime() {
   retained_session.reset();
 }
 
+class IsolatedRuntime final : public Runtime {
+public:
+  explicit IsolatedRuntime(const Application& application)
+      : Runtime([this](std::function<void()> work) {
+          std::lock_guard lock(mutex_);
+          pending_.push_back(std::move(work));
+        }) {
+    InitializeApplication(application, LaunchActivation{}, ApplicationLifecycleState::Active);
+  }
+  ~IsolatedRuntime() override { Retire(); }
+  void OnRuntimeStopped() override {}
+  bool RunOne() {
+    std::function<void()> work;
+    {
+      std::lock_guard lock(mutex_);
+      if (pending_.empty()) return false;
+      work = std::move(pending_.front());
+      pending_.pop_front();
+    }
+    work();
+    return true;
+  }
+  bool Empty() {
+    std::lock_guard lock(mutex_);
+    return pending_.empty();
+  }
+
+private:
+  std::mutex mutex_;
+  std::deque<std::function<void()>> pending_;
+};
+
+class IsolatedWindow final : public UiWindow {
+public:
+  IsolatedWindow(IsolatedRuntime& runtime, const Application& application) : runtime_(runtime) {
+    InitializeWindow(runtime, application.root_factory, application.options.window,
+                     std::nullopt, WindowLifecycleState::Active);
+  }
+  ~IsolatedWindow() override { Retire(); }
+  void RequestFrameAt(double) override {}
+  double Now() const noexcept override { return 0.0; }
+  FontMetrics Metrics(const Font&) override { return {}; }
+  TextRunMetrics MeasureRun(std::string_view, const TextStyle&, const TextShapingOptions&) override { return {}; }
+  TextLayoutMetrics MeasureText(const AttributedText&, const TextStyle&, float, const TextLayoutOptions&) override {
+    return {};
+  }
+  void Drain() {
+    for (int turns = 0; turns < 30; ++turns) {
+      while (runtime_.RunOne()) {
+      }
+      BuildFrame();
+      if (runtime_.Empty()) return;
+    }
+    throw std::runtime_error("UI dispatch did not settle.");
+  }
+
+private:
+  IsolatedRuntime& runtime_;
+};
+
 std::vector<CameraSession> isolated_sessions;
 
+[[huxerui::composable]]
 View IsolatedWindowContent() {
   auto session = UseCamera({.active = false});
   Lifecycle([session] {
@@ -265,15 +379,15 @@ void TestWindowIsolation() {
             });
       }},
   });
-  TestRuntime runtime(application);
-  auto first = std::make_unique<TestPlatform>(runtime, application);
-  auto second = std::make_unique<TestPlatform>(runtime, application);
-  first->Drain(*first);
-  second->Drain(*second);
+  IsolatedRuntime runtime(application);
+  auto first = std::make_unique<IsolatedWindow>(runtime, application);
+  auto second = std::make_unique<IsolatedWindow>(runtime, application);
+  first->Drain();
+  second->Drain();
   Check(isolated_sessions.size() == 2 && hosts.size() == 2, "Each window must create its own camera session.");
   Check(hosts[0] == first.get() && hosts[1] == second.get(), "Camera factories must receive their original window.");
   second.reset();
-  first->Drain(*first);
+  first->Drain();
   Check(isolated_sessions[0].Status().state == SessionState::Stopped, "Closing a peer must not close this session.");
   Check(isolated_sessions[1].Status().state == SessionState::Closed, "Closing a window must close its camera session.");
   first.reset();
@@ -281,99 +395,252 @@ void TestWindowIsolation() {
   isolated_sessions.clear();
 }
 
-class PhotoBackend final : public camera::detail::CameraBackend {
-public:
-  std::function<void(camera::CameraResult<ImageAsset>)> pending;
-  std::function<void()> stopped;
-  camera::PhotoOptions options;
-  int captures = 0;
-  bool synchronous_failure = false;
-
-  void Start(std::optional<camera::Facing>, std::function<void(camera::CameraStatus)>) override {}
-  void Stop(std::function<void()> completed) override { stopped = std::move(completed); }
-  void CapturePhoto(camera::PhotoOptions value,
-                    std::function<void(camera::CameraResult<ImageAsset>)> completed) override {
-    ++captures;
-    options = value;
-    pending = std::move(completed);
-    if (synchronous_failure) {
-      Complete(CameraResult<ImageAsset>::Failure({CameraErrorCode::CaptureFailed, "Synchronous native failure."}));
+void TestZoomRequests() {
+  class ZoomBackend final : public camera::detail::CameraBackend {
+  public:
+    void Start(std::optional<Facing>, std::optional<std::string>, camera::detail::CapturePreferences,
+               StatusCallback) override { ++starts; }
+    void Stop(std::function<void()> completed) override {
+      ++stops;
+      if (completed) completed();
     }
-  }
-  void Complete(camera::CameraResult<ImageAsset> result) {
-    auto completed = std::exchange(pending, {});
-    completed(std::move(result));
-    if (auto stop = std::exchange(stopped, {}))
-      stop();
-  }
-};
+    void ReadZoom(std::function<void(std::optional<Zoom>)> completed) override {
+      completed(Zoom{.ratio = 1.0F, .min_ratio = 1.0F, .max_ratio = 4.0F});
+    }
+    bool CanReplaceZoomRequest() const noexcept override { return replace_active; }
+    void SetZoomRatio(float ratio, std::function<void(CameraResult<Zoom>)> completed) override {
+      if (completion) {
+        Check(replace_active && !replaced, "Only a replaceable zoom adjustment may be superseded.");
+        replaced = std::move(completion);
+      }
+      targets.push_back(ratio);
+      completion = std::move(completed);
+    }
+    void Complete(float ratio) {
+      auto complete = std::exchange(completion, {});
+      complete(CameraResult<Zoom>::Success({.ratio = ratio, .min_ratio = 1.0F, .max_ratio = 4.0F}));
+    }
+    int starts = 0;
+    int stops = 0;
+    bool replace_active = false;
+    std::vector<float> targets;
+    std::function<void(CameraResult<Zoom>)> completion;
+    std::function<void(CameraResult<Zoom>)> replaced;
+  };
 
-struct PhotoTestContext {
-  std::shared_ptr<camera::detail::CameraSessionData> owner;
-  std::shared_ptr<PhotoBackend> backend = std::make_shared<PhotoBackend>();
-  std::optional<TaskScope> callers;
-  State<bool> visible;
-  Facing facing = Facing::Front;
-};
-
-[[huxerui::composable]]
-View PhotoTestOwner(PhotoTestContext* context) {
-  auto status = UseState(CameraStatus{.state = SessionState::Running, .actual_facing = context->facing});
-  auto tasks = UseTaskScope();
-  auto retained = UseState(std::make_shared<camera::detail::CameraSessionData>(status, tasks, UseApplication()));
-  context->owner = retained;
-  Lifecycle([owner = context->owner, backend = context->backend] {
-    owner->backend = backend;
-    owner->engaged = true;
-    return [owner] { owner->Close(); };
-  }, context->owner);
-  return Canvas([](PaintContext&, Size) {});
-}
-
-PhotoTestContext* active_photo_test = nullptr;
-
-[[huxerui::composable]]
-View PhotoTestContent(PhotoTestContext* context) {
-  context->callers = UseTaskScope();
-  context->visible = UseState(true);
-  return context->visible ? PhotoTestOwner(context) : View{};
-}
-
-View PhotoTestRoot() { return PhotoTestContent(active_photo_test); }
-
-class PhotoTestFixture {
-public:
-  PhotoTestContext context;
-  Application application;
-  TestRuntime application_runtime;
-  TestPlatform platform;
-  UiWindow& runtime;
-
-  explicit PhotoTestFixture(Facing facing = Facing::Front)
-      : application(PhotoTestRoot, {.show_debug_overlay = false}),
-        application_runtime(application),
-        platform(application_runtime, application),
-        runtime(platform) {
-    Check(!active_photo_test, "Photo fixtures must not overlap.");
-    active_photo_test = &context;
-    context.facing = facing;
-    runtime.SetWindowMetrics({.viewport = {320.0F, 240.0F}});
-    Drain();
-  }
-
-  ~PhotoTestFixture() { active_photo_test = nullptr; }
-
-  TaskHandle Launch(std::optional<CameraResult<ImageAsset>>& result, PhotoOptions options = {}) {
-    return context.callers->Launch([&result, options, owner = context.owner]() -> Task<void> {
-      result = co_await camera::detail::CapturePhoto(owner, options);
+  PhotoTestFixture fixture;
+  const auto owner = fixture.context.owner;
+  auto backend = std::make_shared<ZoomBackend>();
+  owner->backend = backend;
+  owner->ReadZoom();
+  fixture.Drain();
+  const auto launch = [&](float ratio, std::optional<CameraResult<void>>& result) {
+    return fixture.context.callers->Launch([owner, ratio, &result]() -> Task<void> {
+      result = co_await camera::detail::SetZoomRatio(owner, ratio);
     });
-  }
+  };
 
-  void Drain() { platform.Drain(runtime); }
-  void Await(const std::optional<CameraResult<ImageAsset>>& result) {
-    platform.Await(runtime, [&] { return result.has_value(); });
-  }
-};
+  std::optional<CameraResult<void>> first;
+  std::optional<CameraResult<void>> superseded;
+  std::optional<CameraResult<void>> last;
+  launch(0.5F, first);
+  fixture.Drain();
+  launch(2.0F, superseded);
+  launch(8.0F, last);
+  fixture.Drain();
+  Check(backend->targets == std::vector{1.0F}, "Zoom must clamp the lower bound and keep the newest pending request.");
+  Check(superseded && superseded->Error().code == CameraErrorCode::Interrupted,
+        "A superseded zoom request must complete with Interrupted.");
+
+  backend->Complete(1.0F);
+  fixture.Drain();
+  Check(first && first->Succeeded() && backend->targets == std::vector{1.0F, 4.0F},
+        "The latest pending zoom must be clamped and applied next.");
+  backend->Complete(3.75F);
+  fixture.Drain();
+  Check(last && last->Succeeded() && owner->status->zoom && owner->status->zoom->ratio == 3.75F,
+        "Zoom status must report the ratio confirmed by the device.");
+  Check(backend->starts == 0 && backend->stops == 0, "Zoom must keep the current capture running.");
+
+  backend->replace_active = true;
+  std::optional<CameraResult<void>> replaced;
+  std::optional<CameraResult<void>> latest;
+  launch(2.0F, replaced);
+  fixture.Drain();
+  launch(3.0F, latest);
+  fixture.Drain();
+  Check(replaced && replaced->Error().code == CameraErrorCode::Interrupted && backend->targets.back() == 3.0F,
+        "A replaceable backend must receive the latest zoom before the previous result arrives.");
+  auto stale = std::exchange(backend->replaced, {});
+  stale(CameraResult<Zoom>::Success({.ratio = 2.0F, .min_ratio = 1.0F, .max_ratio = 4.0F}));
+  fixture.Drain();
+  Check(owner->status->zoom && owner->status->zoom->ratio == 3.75F && !latest,
+        "An obsolete result must not change the applied zoom or complete the latest request.");
+  backend->Complete(3.0F);
+  fixture.Drain();
+  Check(latest && latest->Succeeded() && owner->status->zoom && owner->status->zoom->ratio == 3.0F,
+        "The latest confirmed ratio must update the status.");
+
+  std::optional<CameraResult<void>> interrupted;
+  launch(2.0F, interrupted);
+  fixture.Drain();
+  owner->Close();
+  fixture.Drain();
+  Check(interrupted && interrupted->Error().code == CameraErrorCode::Interrupted,
+        "Closing capture must interrupt its active zoom request.");
+  backend->Complete(2.0F);
+  fixture.Drain();
+  Check(owner->status->state == SessionState::Closed && !owner->status->zoom,
+        "A late zoom response must not restore closed camera state.");
+}
+
+void TestExposureCompensationRequests() {
+  class ExposureBackend final : public camera::detail::CameraBackend {
+  public:
+    void Start(std::optional<Facing>, std::optional<std::string>, camera::detail::CapturePreferences,
+               StatusCallback) override { ++starts; }
+    void Stop(std::function<void()> completed) override {
+      ++stops;
+      if (completed) completed();
+    }
+    void ReadExposureCompensation(std::function<void(std::optional<ExposureCompensation>)> completed) override {
+      completed({{.ev = 0.0F, .min_ev = -2.0F, .max_ev = 2.0F, .step_ev = 0.5F}});
+    }
+    void SetExposureCompensation(float ev, std::function<void(CameraResult<ExposureCompensation>)> completed) override {
+      targets.push_back(ev);
+      completion = std::move(completed);
+    }
+    void Complete(float ev) {
+      auto complete = std::exchange(completion, {});
+      complete(CameraResult<ExposureCompensation>::Success(
+          {.ev = ev, .min_ev = -2.0F, .max_ev = 2.0F, .step_ev = 0.5F}));
+    }
+
+    int starts = 0;
+    int stops = 0;
+    std::vector<float> targets;
+    std::function<void(CameraResult<ExposureCompensation>)> completion;
+  };
+
+  PhotoTestFixture fixture;
+  const auto owner = fixture.context.owner;
+  auto backend = std::make_shared<ExposureBackend>();
+  owner->backend = backend;
+  const auto launch = [&](float ev, std::optional<CameraResult<void>>& result) {
+    fixture.context.callers->Launch([owner, ev, &result]() -> Task<void> {
+      result = co_await camera::detail::SetExposureCompensation(owner, ev);
+    });
+    fixture.Drain();
+  };
+
+  std::optional<CameraResult<void>> unavailable;
+  launch(0.0F, unavailable);
+  Check(unavailable && unavailable->Error().code == CameraErrorCode::Unavailable,
+        "Exposure compensation requires an available device range.");
+  owner->ReadExposureCompensation();
+  fixture.Drain();
+  Check(owner->status->exposure_compensation && owner->status->exposure_compensation->step_ev == 0.5F,
+        "The exposure compensation range includes the device step.");
+
+  std::optional<CameraResult<void>> first;
+  std::optional<CameraResult<void>> superseded;
+  std::optional<CameraResult<void>> reset;
+  launch(-4.0F, first);
+  launch(0.8F, superseded);
+  launch(0.0F, reset);
+  Check(backend->targets == std::vector{-2.0F} && superseded &&
+        superseded->Error().code == CameraErrorCode::Interrupted,
+        "Exposure compensation must clamp the request and keep the newest pending value.");
+  backend->Complete(-1.5F);
+  fixture.Drain();
+  Check(first && first->Succeeded() && owner->status->exposure_compensation->ev == -1.5F &&
+        backend->targets == std::vector{-2.0F, 0.0F},
+        "The confirmed EV must be published before applying the pending reset.");
+  backend->Complete(0.0F);
+  fixture.Drain();
+  Check(reset && reset->Succeeded() && owner->status->exposure_compensation->ev == 0.0F &&
+        backend->starts == 0 && backend->stops == 0, "Resetting EV must keep capture running.");
+
+  std::optional<CameraResult<void>> interrupted;
+  launch(1.0F, interrupted);
+  owner->Close();
+  backend->Complete(1.0F);
+  fixture.Drain();
+  Check(interrupted && interrupted->Error().code == CameraErrorCode::Interrupted &&
+        !owner->status->exposure_compensation, "A late EV result must not restore a closed camera's capability.");
+}
+
+void TestFlashAndTorchRequests() {
+  PhotoTestFixture fixture;
+  const auto& owner = fixture.context.owner;
+  const auto& backend = fixture.context.backend;
+  auto status = owner->status.Get();
+  status.photo_flash.supports_on = true;
+  status.torch = Torch{.available = true};
+  owner->status = status;
+  const auto request_torch = [&](bool enabled, std::optional<CameraResult<void>>& result) {
+    fixture.context.callers->Launch([owner, enabled, &result]() -> Task<void> {
+      result = co_await camera::detail::SetTorchEnabled(owner, enabled);
+    });
+    fixture.Drain();
+  };
+
+  std::optional<CameraResult<ImageAsset>> photo;
+  fixture.Launch(photo, {.flash_mode = FlashMode::Auto});
+  fixture.Await(photo);
+  Check(photo->Error().code == CameraErrorCode::Unavailable && backend->captures == 0,
+        "An unsupported flash mode must not reach the camera.");
+
+  std::optional<CameraResult<void>> torch;
+  request_torch(true, torch);
+  Check(backend->pending_torch && !torch, "The torch task must wait for platform completion.");
+  photo.reset();
+  fixture.Launch(photo, {.flash_mode = FlashMode::On});
+  fixture.Await(photo);
+  Check(photo->Error().code == CameraErrorCode::OperationInProgress && backend->captures == 0,
+        "A pending torch adjustment must exclude flash photos.");
+  status.torch->enabled = true;
+  owner->status = status;
+  std::exchange(backend->pending_torch, {})(CameraResult<void>::Success());
+  fixture.Drain();
+  Check(torch && torch->Succeeded(), "The torch task must report the platform result.");
+
+  photo.reset();
+  fixture.Launch(photo, {.flash_mode = FlashMode::On});
+  fixture.Await(photo);
+  Check(photo->Error().code == CameraErrorCode::Unavailable && backend->captures == 0,
+        "The torch must be off before taking a flash photo.");
+  photo.reset();
+  fixture.Launch(photo);
+  fixture.Drain();
+  Check(backend->captures == 1 && backend->options.flash_mode == FlashMode::Off,
+        "A photo with flash off can use the continuous light.");
+  backend->Complete(CameraResult<ImageAsset>::Success(ImageAsset{}));
+  fixture.Await(photo);
+
+  status.torch->enabled = false;
+  owner->status = status;
+  photo.reset();
+  fixture.Launch(photo, {.flash_mode = FlashMode::On});
+  fixture.Drain();
+  Check(backend->options.flash_mode == FlashMode::On, "The selected flash mode must reach the photo backend.");
+  torch.reset();
+  request_torch(true, torch);
+  Check(torch && torch->Error().code == CameraErrorCode::OperationInProgress && !backend->pending_torch,
+        "A pending flash photo must exclude torch adjustments.");
+  backend->Complete(CameraResult<ImageAsset>::Success(ImageAsset{}));
+  fixture.Await(photo);
+
+  torch.reset();
+  request_torch(true, torch);
+  owner->Close();
+  fixture.Drain();
+  Check(torch && torch->Error().code == CameraErrorCode::Interrupted && !owner->status->torch,
+        "Closing capture must interrupt an active torch adjustment and clear its status.");
+  std::exchange(backend->pending_torch, {})(CameraResult<void>::Success());
+  fixture.Drain();
+  Check(!owner->status->torch, "A late torch result must not restore closed camera status.");
+}
 
 void TestPhotoRequests() {
   {
@@ -477,7 +744,7 @@ void TestPhotoRequests() {
     std::optional<CameraResult<ImageAsset>> result;
     fixture.Launch(result);
     fixture.Drain();
-    Check(owner->engaged && !owner->failure && owner->desired.facing == owner->opened_facing,
+    Check(owner->engaged && !owner->failure && owner->desired.facing == owner->opened.facing,
           "Interruption scenarios must start with a healthy, matching camera configuration.");
     auto options = CameraOptions{};
     if (!background)
@@ -512,6 +779,25 @@ void TestPhotoRequests() {
     fixture.Await(result);
     Check(result->Error().code == CameraErrorCode::NotReady, "Closed camera must reject photos.");
   }
+  {
+    PhotoTestFixture fixture;
+    std::optional<CameraResult<ImageAsset>> result;
+    auto task = fixture.Launch(result);
+    task.Cancel();
+    fixture.Drain();
+    Check(!result && fixture.context.backend->captures == 0,
+          "Cancellation before lazy startup must not start native capture.");
+    Check(!fixture.context.owner->status->capturing_photo, "Canceled startup must not reserve the capture slot.");
+  }
+  {
+    PhotoTestFixture fixture;
+    fixture.context.backend->synchronous_failure = true;
+    std::optional<CameraResult<ImageAsset>> result;
+    (void)fixture.Launch(result);
+    fixture.Await(result);
+    Check(result->Error().code == CameraErrorCode::CaptureFailed, "Synchronous native errors must complete the Task.");
+    Check(!fixture.context.owner->status->capturing_photo, "Synchronous completion must release the capture slot.");
+  }
 }
 
 } // namespace
@@ -519,10 +805,17 @@ void TestPhotoRequests() {
 int main() {
   try {
     TestGeometry();
+    TestFrameProcessorFactory();
+    TestOutputCrop();
+    TestProducerSize();
+    TestCaptureFormatRank();
     TestSessionLifetime();
     TestWindowIsolation();
+    TestZoomRequests();
+    TestExposureCompensationRequests();
+    TestFlashAndTorchRequests();
     TestPhotoRequests();
-    std::cout << "Camera geometry, session lifetime, and photo request tests passed.\n";
+    std::cout << "Camera tests passed.\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

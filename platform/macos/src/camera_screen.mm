@@ -369,11 +369,16 @@ namespace {
 class MacScreenCamera final : public CameraBackend {
 public:
   explicit MacScreenCamera(NSWindow* window) : capture_([[HUXMacScreenCapture alloc] initWithWindow:window]) {}
-  void Start(std::optional<Facing>, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing>, std::optional<std::string>, CapturePreferences, StatusCallback changed) override {
     changed({.state = SessionState::Failed,
-             .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}});
+             .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}},
+            full_texture_crop);
   }
-  void StartScreen(std::function<void(CameraStatus)> changed) override { [capture_ start:std::move(changed)]; }
+  void StartScreen(StatusCallback changed) override {
+    [capture_ start:[changed = std::move(changed)](CameraStatus status) mutable {
+      changed(std::move(status), full_texture_crop);
+    }];
+  }
   void SetScreenRegion(std::optional<huxerui::Rect> region) override { [capture_ setRegion:region]; }
   void Stop(std::function<void()> completed) override { [capture_ stop:std::move(completed)]; }
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {

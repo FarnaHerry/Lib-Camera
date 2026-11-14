@@ -84,26 +84,30 @@ public:
     if (original_region_) DeleteObject(original_region_);
   }
 
-  void Start(std::optional<Facing>, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing>, std::optional<std::string>, CapturePreferences, StatusCallback changed) override {
     changed({.state = SessionState::Failed,
-             .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}});
+             .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}},
+            full_texture_crop);
   }
 
-  void StartScreen(std::function<void(CameraStatus)> changed) override {
+  void StartScreen(StatusCallback changed) override {
     if (active_ || GetPropW(window_, L"HuxerUI.Camera.ScreenAperture")) {
       changed({.state = SessionState::Failed,
-               .error = CameraError{CameraErrorCode::DeviceBusy, "This window already has a screen viewfinder."}});
+               .error = CameraError{CameraErrorCode::DeviceBusy, "This window already has a screen viewfinder."}},
+              full_texture_crop);
       return;
     }
     if (!IsWindow(window_) || GetAncestor(window_, GA_ROOT) != window_) {
       changed({.state = SessionState::Failed,
-               .error = CameraError{CameraErrorCode::Unavailable, "Screen capture requires an owned top-level window."}});
+               .error = CameraError{CameraErrorCode::Unavailable, "Screen capture requires an owned top-level window."}},
+              full_texture_crop);
       return;
     }
     if (!GetWindowDisplayAffinity(window_, &previous_affinity_) ||
         !SetWindowDisplayAffinity(window_, WDA_EXCLUDEFROMCAPTURE)) {
       changed({.state = SessionState::Failed,
-               .error = CameraError{CameraErrorCode::Unavailable, "Windows cannot exclude this window from capture."}});
+               .error = CameraError{CameraErrorCode::Unavailable, "Windows cannot exclude this window from capture."}},
+              full_texture_crop);
       return;
     }
     affinity_applied_ = true;
@@ -112,7 +116,8 @@ public:
     if (!original_region_) {
       RestoreAffinity();
       changed({.state = SessionState::Failed,
-               .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot save the window region."}});
+               .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot save the window region."}},
+              full_texture_crop);
       return;
     }
     if (GetWindowRgn(window_, original_region_) == ERROR)
@@ -120,14 +125,16 @@ public:
     if (!SetWindowSubclass(window_, WindowProcedure, reinterpret_cast<UINT_PTR>(this), reinterpret_cast<DWORD_PTR>(this))) {
       RestoreAffinity();
       changed({.state = SessionState::Failed,
-               .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot attach the screen viewfinder."}});
+               .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot attach the screen viewfinder."}},
+              full_texture_crop);
       return;
     }
     if (!SetPropW(window_, L"HuxerUI.Camera.ScreenAperture", this)) {
       RemoveWindowSubclass(window_, WindowProcedure, reinterpret_cast<UINT_PTR>(this));
       RestoreAffinity();
       changed({.state = SessionState::Failed,
-               .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot own the screen viewfinder."}});
+               .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot own the screen viewfinder."}},
+              full_texture_crop);
       return;
     }
     changed_ = std::move(changed);
@@ -232,7 +239,8 @@ private:
       if (visible) DeleteObject(visible);
       updating_region_ = false;
       changed_({.state = SessionState::Failed,
-                 .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot make the screen viewfinder transparent."}});
+                 .error = CameraError{CameraErrorCode::ConfigurationFailed, "Cannot make the screen viewfinder transparent."}},
+               full_texture_crop);
       return;
     }
     // SetWindowRgn owns visible after success. The desktop compositor supplies the pixels in the hole.
@@ -240,7 +248,7 @@ private:
     const bool ready = area.has_value();
     if (running_ != ready) {
       running_ = ready;
-      changed_({.state = ready ? SessionState::Running : SessionState::Starting});
+      changed_({.state = ready ? SessionState::Running : SessionState::Starting}, full_texture_crop);
     }
   }
 
@@ -386,7 +394,7 @@ private:
   HRGN original_region_ = nullptr;
   std::optional<Rect> region_;
   std::optional<bool> running_;
-  std::function<void(CameraStatus)> changed_;
+  StatusCallback changed_;
   bool active_ = false;
   bool updating_region_ = false;
   bool affinity_applied_ = false;

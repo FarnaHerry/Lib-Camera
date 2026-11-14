@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -116,6 +117,41 @@ std::uint32_t FormatPriority(std::uint32_t fourcc) noexcept {
   const auto* found = std::find(std::begin(priority), std::end(priority), fourcc);
   return found == std::end(priority) ? static_cast<std::uint32_t>(std::size(priority))
                                      : static_cast<std::uint32_t>(found - std::begin(priority));
+}
+
+/// Reports the configured frame-rate bounds when the driver exposes them.
+std::optional<FrameRateRange> QueryFrameRateRange(int fd) {
+  v4l2_streamparm parm{};
+  parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (Xioctl(fd, VIDIOC_G_PARM, &parm) != 0 ||
+      (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME) == 0) {
+    return {};
+  }
+  const auto& interval = parm.parm.capture.timeperframe;
+  if (interval.numerator == 0 || interval.denominator == 0) {
+    return {};
+  }
+  const double fps = static_cast<double>(interval.denominator) / static_cast<double>(interval.numerator);
+  return FrameRateRange{fps, fps};
+}
+
+/// Requests the preferred rate as a streaming hint; drivers may keep their own default.
+void ApplyPreferredFrameRate(int fd, std::optional<double> preferred) {
+  if (!preferred || !std::isfinite(*preferred) || *preferred <= 0) {
+    return;
+  }
+  v4l2_streamparm parm{};
+  parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (Xioctl(fd, VIDIOC_G_PARM, &parm) != 0 ||
+      (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME) == 0) {
+    return;
+  }
+  constexpr std::uint32_t kDenominator = 1000;
+  const auto numerator = std::max<std::uint32_t>(
+      1U, static_cast<std::uint32_t>(std::lround(static_cast<double>(kDenominator) / *preferred)));
+  parm.parm.capture.timeperframe.numerator = numerator;
+  parm.parm.capture.timeperframe.denominator = kDenominator;
+  Xioctl(fd, VIDIOC_S_PARM, &parm);
 }
 
 // ----- software frame conversion, writing packed Bgra8888 rows with straight alpha -----
@@ -267,7 +303,7 @@ void ConvertBgr32(const std::byte* source, std::uint32_t stride, std::byte* dest
 /// Serializes status delivery so a producer-thread failure cannot interleave with queue-thread reports.
 class StatusSink {
 public:
-  void Set(std::function<void(CameraStatus)> changed) {
+  void Set(CameraBackend::StatusCallback changed) {
     std::lock_guard lock(mutex_);
     changed_ = std::move(changed);
     reported_ = false;
@@ -279,19 +315,19 @@ public:
   }
 
   void Publish(CameraStatus status) {
-    std::function<void(CameraStatus)> callback;
+    CameraBackend::StatusCallback callback;
     {
       std::lock_guard lock(mutex_);
       callback = changed_;
     }
     if (callback) {
-      callback(std::move(status));
+      callback(std::move(status), full_texture_crop);
     }
   }
 
   /// Reports a failure once; later failures are dropped because the session already saw one cause.
   void Fail(CameraError error) {
-    std::function<void(CameraStatus)> callback;
+    CameraBackend::StatusCallback callback;
     {
       std::lock_guard lock(mutex_);
       if (changed_ && !reported_) {
@@ -300,13 +336,13 @@ public:
       }
     }
     if (callback) {
-      callback({.state = SessionState::Failed, .error = std::move(error)});
+      callback({.state = SessionState::Failed, .error = std::move(error)}, full_texture_crop);
     }
   }
 
 private:
   std::mutex mutex_;
-  std::function<void(CameraStatus)> changed_;
+  CameraBackend::StatusCallback changed_;
   bool reported_ = false;
 };
 
@@ -367,15 +403,18 @@ public:
         .detach();
   }
 
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) {
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, CameraBackend::StatusCallback changed) {
     sink_.Set(std::move(changed));
     try {
       StopStream();
       ShutdownStream();
       CloseDevice();
-      auto device = SelectDevice(facing);
+      auto device = SelectDevice(facing, device_id);
       if (!device) {
-        throw CameraFailure(CameraErrorCode::DeviceNotFound, "No camera matches the requested facing.");
+        throw CameraFailure(CameraErrorCode::DeviceNotFound,
+                            device_id ? "The requested camera device is unavailable."
+                                      : "No camera matches the requested facing.");
       }
       fd_ = ::open(device->path.c_str(), O_RDWR | O_CLOEXEC);
       if (fd_ < 0) {
@@ -383,18 +422,21 @@ public:
                           errno == EACCES ? CameraErrorCode::PermissionDenied : CameraErrorCode::DeviceNotFound);
       }
       facing_ = device->facing;
+      device_id_ = device->path.string();
       rotation_ = static_cast<PreviewRotation>(device->rotation / 90U);
       const auto candidates = EnumerateStreamFormats(fd_);
-      preview_format_ = SelectLinuxPreviewFormat(candidates);
+      preview_format_ = SelectPreviewFormat(candidates, preferred);
       photo_format_ = SelectLinuxPhotoFormat(candidates);
       if (preview_format_.fourcc == 0) {
         throw CameraFailure(CameraErrorCode::Unavailable, "This camera offers no supported preview format.");
       }
-      BeginPreview();
+      BeginPreview(preferred);
       running_ = true;
       sink_.Publish({.state = SessionState::Running,
                      .actual_facing = facing_,
-                     .preview = PreviewOutput{.texture = texture_, .rotation = rotation_}});
+                     .preview = PreviewOutput{.texture = texture_, .rotation = rotation_},
+                     .capture_format = CaptureFormat{width_, height_, QueryFrameRateRange(fd_)},
+                     .actual_device_id = device_id_});
     } catch (const CameraError& error) {
       RecoverFromFailedStart();
       sink_.Fail(error);
@@ -415,6 +457,7 @@ public:
     preview_format_ = {};
     photo_format_ = {};
     facing_.reset();
+    device_id_.clear();
     rotation_ = PreviewRotation::R0;
     if (completed) {
       completed();
@@ -596,10 +639,14 @@ private:
     return 0;
   }
 
-  static std::optional<LinuxDeviceNode> SelectDevice(std::optional<Facing> requested) {
+  static std::optional<LinuxDeviceNode> SelectDevice(std::optional<Facing> requested,
+                                                     const std::optional<std::string>& requested_id) {
     bool access_denied = false;
     std::optional<LinuxDeviceNode> fallback;
     for (auto& candidate : EnumerateDeviceNodes()) {
+      if (requested_id && candidate.path.string() != *requested_id) {
+        continue;
+      }
       DeviceFile file(candidate.path);
       if (!file.Opened()) {
         access_denied |= errno == EACCES;
@@ -615,6 +662,11 @@ private:
       const bool usable = SelectLinuxPreviewFormat(formats).fourcc != 0 || SelectLinuxPhotoFormat(formats).fourcc != 0;
       if (!usable) {
         continue;
+      }
+      if (requested_id) {
+        candidate.facing = facing;
+        candidate.rotation = rotation;
+        return candidate;
       }
       if (requested) {
         // An explicit facing has no fallback; unknown-facing devices are not substitutes.
@@ -637,6 +689,92 @@ private:
     return fallback;
   }
 
+  /// Picks the raw format closest to the preferred size, falling back to the default choice.
+  static LinuxStreamFormat SelectPreviewFormat(const std::vector<LinuxStreamFormat>& candidates,
+                                               const CapturePreferences& preferred) {
+    if (!preferred.pixel_width || !preferred.pixel_height) {
+      return SelectLinuxPreviewFormat(candidates);
+    }
+    LinuxStreamFormat best;
+    double best_distance = 0.0;
+    std::uint32_t best_priority = 0;
+    std::uint64_t best_pixels = 0;
+    for (const auto& candidate : candidates) {
+      if (LinuxConverterFor(candidate.fourcc) == nullptr || candidate.width < 16U || candidate.height < 16U ||
+          candidate.width > kMaxFrameDimension || candidate.height > kMaxFrameDimension) {
+        continue;
+      }
+      const auto [size_distance, fps_distance, fps_spread] =
+          CaptureFormatRank(preferred, CaptureFormat{candidate.width, candidate.height, {}});
+      static_cast<void>(fps_distance);
+      static_cast<void>(fps_spread);
+      const auto priority = FormatPriority(candidate.fourcc);
+      const auto pixels = static_cast<std::uint64_t>(candidate.width) * candidate.height;
+      const bool better = best.fourcc == 0 || size_distance < best_distance ||
+          (size_distance == best_distance &&
+           (priority < best_priority || (priority == best_priority && pixels > best_pixels)));
+      if (better) {
+        best = candidate;
+        best_distance = size_distance;
+        best_priority = priority;
+        best_pixels = pixels;
+      }
+    }
+    return best.fourcc != 0 ? best : SelectLinuxPreviewFormat(candidates);
+  }
+
+  static std::string QueryCardName(int fd) {
+    v4l2_capability capability{};
+    if (Xioctl(fd, VIDIOC_QUERYCAP, &capability) != 0) {
+      return {};
+    }
+    std::string name;
+    for (const char character : capability.card) {
+      if (character == '\0') {
+        break;
+      }
+      name.push_back(character);
+    }
+    return name;
+  }
+
+public:
+  /// Lists usable capture nodes for EnumerateDevicesAsync.
+  static CameraDevicesResult EnumerateCameras() {
+    try {
+      std::vector<CameraDevice> devices;
+      bool access_denied = false;
+      for (const auto& candidate : EnumerateDeviceNodes()) {
+        DeviceFile file(candidate.path);
+        if (!file.Opened()) {
+          access_denied |= errno == EACCES;
+          continue;
+        }
+        const int fd = file.Get();
+        if (!IsCaptureNode(fd)) {
+          continue;
+        }
+        const auto formats = EnumerateStreamFormats(fd);
+        if (SelectLinuxPreviewFormat(formats).fourcc == 0 && SelectLinuxPhotoFormat(formats).fourcc == 0) {
+          continue;
+        }
+        auto name = QueryCardName(fd);
+        if (name.empty()) {
+          name = candidate.path.filename().string();
+        }
+        devices.push_back({candidate.path.string(), std::move(name), QueryFacing(fd)});
+      }
+      if (devices.empty() && access_denied) {
+        return CameraDevicesResult::Failure(
+            {CameraErrorCode::PermissionDenied, "Camera device access was denied."});
+      }
+      return CameraDevicesResult::Success(std::move(devices));
+    } catch (const std::exception& error) {
+      return CameraDevicesResult::Failure({CameraErrorCode::CaptureFailed, error.what()});
+    }
+  }
+
+private:
   static std::vector<LinuxStreamFormat> EnumerateStreamFormats(int fd) {
     std::vector<LinuxStreamFormat> formats;
     v4l2_fmtdesc description{};
@@ -742,8 +880,9 @@ private:
     RequireIoctl(fd_, VIDIOC_STREAMOFF, &type);
   }
 
-  void BeginPreview() {
+  void BeginPreview(const CapturePreferences& preferred) {
     ConfigureStream(preview_format_, true);
+    ApplyPreferredFrameRate(fd_, preferred.fps);
     texture_ = std::make_shared<linux::PixelTexture>(Size{static_cast<float>(width_), static_cast<float>(height_)});
     AllocateBuffers(kPreviewBufferCount);
     StreamOn();
@@ -924,6 +1063,7 @@ private:
   std::atomic<bool> stop_stream_{false};
   std::thread stream_thread_;
   std::optional<Facing> facing_;
+  std::string device_id_;
   PreviewRotation rotation_ = PreviewRotation::R0;
   LinuxStreamFormat preview_format_;
   LinuxStreamFormat photo_format_;
@@ -962,18 +1102,22 @@ public:
     }
   }
 
-  void Start(std::optional<Facing>, std::function<void(CameraStatus)> changed) override {
+  void Start(std::optional<Facing>, std::optional<std::string>, CapturePreferences,
+             StatusCallback changed) override {
     changed({.state = SessionState::Failed,
-             .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}});
+             .error = CameraError{CameraErrorCode::Unavailable, "This backend captures the screen only."}},
+            full_texture_crop);
   }
 
-  void StartScreen(std::function<void(CameraStatus)> changed) override {
+  void StartScreen(StatusCallback changed) override {
     marker_alive_ = std::make_shared<std::atomic_bool>(true);
     active_ = true;
     if (x11_) {
       // The anchor may have laid out before activation; seed the saved rectangle first.
       x11_->SetRegion(region_);
-      x11_->Activate(std::move(changed));
+      x11_->Activate([changed = std::move(changed)](CameraStatus status) mutable {
+        changed(std::move(status), full_texture_crop);
+      });
       return;
     }
     changed_ = std::move(changed);
@@ -1046,14 +1190,14 @@ private:
     const bool ready = region_.has_value() && !region_->IsEmpty();
     linux::SetWindowAperture(window_, ready ? region_ : std::nullopt);
     if (changed_) {
-      changed_({.state = ready ? SessionState::Running : SessionState::Starting});
+      changed_({.state = ready ? SessionState::Running : SessionState::Starting}, full_texture_crop);
     }
   }
 
   UiWindow& window_;
   std::unique_ptr<LinuxX11Screen> x11_;
   std::optional<Rect> region_;
-  std::function<void(CameraStatus)> changed_;
+  StatusCallback changed_;
   std::shared_ptr<std::atomic_bool> marker_alive_;
   bool active_ = false;
 };
@@ -1073,20 +1217,31 @@ public:
     }
   }
 
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
+  bool SupportsFrameProcessing() const noexcept override { return false; }
+
+  Task<CameraDevicesResult> EnumerateDevices() override {
+    co_return co_await RunWorker(&LinuxCapture::EnumerateCameras);
+  }
+
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, StatusCallback changed) override {
     screen_active_ = false;
-    capture_->Post([capture = capture_, facing, changed = std::move(changed)] { capture->Start(facing, changed); });
+    capture_->Post([capture = capture_, facing, device_id = std::move(device_id), preferred,
+                    changed = std::move(changed)]() mutable {
+      capture->Start(facing, std::move(device_id), preferred, std::move(changed));
+    });
     needs_stop_ = true;
   }
 
-  void StartScreen(std::function<void(CameraStatus)> changed) override {
+  void StartScreen(StatusCallback changed) override {
     screen_active_ = true;
     if (screen_) {
       screen_->StartScreen(std::move(changed));
     } else {
       std::move(changed)({.state = SessionState::Failed,
                           .error = CameraError{CameraErrorCode::Unavailable,
-                                               "Screen capture requires an attached window."}});
+                                               "Screen capture requires an attached window."}},
+                         full_texture_crop);
     }
     needs_stop_ = true;
   }

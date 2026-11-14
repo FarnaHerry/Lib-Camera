@@ -504,7 +504,7 @@ void TestDevice() {
   auto camera = CreateLinuxCamera();
   const auto begin = [&](std::optional<Facing> facing) {
     auto probe = std::make_shared<DeviceProbe>();
-    camera->Start(facing, [probe](CameraStatus value) {
+    camera->Start(facing, std::nullopt, {}, [probe](CameraStatus value, Rect) {
       std::lock_guard lock(probe->mutex);
       probe->status = std::move(value);
       probe->ready.notify_all();

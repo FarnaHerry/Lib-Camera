@@ -189,7 +189,7 @@ The first format is JPEG, with quality 1–100 and scale 1. The capture target o
 
 Android binds ImageCapture with Preview and performs JPEG normalization on a separate executor. The iOS and macOS implementations remain separate; each owns AVCapturePhotoOutput, a per-request delegate retained through final capture, and a photo processing queue. Stop completion waits for both preview release and photo cleanup. Unsupported preview/photo output combinations fall back to preview where configuration APIs can detect the limitation.
 
-The current SDK has no public callback-to-Task completion primitive. The private request stores one completion behind a condition variable; RunWorker bridges that completion through the SDK's existing cancellation and UI-dispatch contract. Platform callbacks never directly resume coroutine frames. At most one such wait belongs to a session, and interruption releases it independently of platform cleanup.
+The shared completion primitive is `AwaitCallback`. The private request stores one `CallbackCompletion` guarded against late native callbacks; cancellation suppresses delivery while platform cleanup retains the single request slot. Platform callbacks never directly resume coroutine frames. At most one such request belongs to a session, and interruption releases it independently of platform cleanup.
 
 `CapturePreviewFrameAsync` shares that request machinery and the one-request-at-a-time rule. It delivers a JPEG of the newest frame the live preview is showing without changing the capture mode: backends that can read their newest frame directly do so, and the rest delegate to the native still-photo output. Resolution therefore follows the preview stream rather than a separate photo negotiation. Applications choose it for an immediate what-you-see-is-what-you-get snapshot and `CapturePhotoAsync` when the native photo resolution matters.
 
@@ -401,7 +401,7 @@ platform/android/src/main/cpp/...
 platform/android/src/main/java/org/huxerui/lib/camera/...
 platform/macos/src/...
 platform/ios/src/camera.mm
-platform/ios/Package.swift
+platform/ios/Camera/Package.swift
 platform/windows/src/camera.cpp
 platform/windows/src/camera_photo.cpp
 platform/windows/src/camera_windows.h

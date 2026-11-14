@@ -2,6 +2,8 @@
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #include <utility>
 
@@ -15,8 +17,136 @@
 
 using namespace huxerui;
 using namespace huxerui::camera;
+using huxerui::camera::detail::CameraBackend;
+using huxerui::camera::detail::CameraDevicesResult;
+using huxerui::camera::detail::CaptureFormatRank;
+using huxerui::camera::detail::CapturePreferences;
+using huxerui::camera::detail::FramePipeline;
+using huxerui::camera::detail::FrameProducer;
+using huxerui::camera::detail::ProcessedFrame;
+using huxerui::camera::detail::full_texture_crop;
 
 namespace {
+
+char lighting_observation;
+
+NSArray<AVCaptureDevice*>* DiscoverCameras() {
+  NSArray<AVCaptureDeviceType>* types;
+  if (@available(macOS 14.0, *)) {
+    types = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternal,
+              AVCaptureDeviceTypeContinuityCamera];
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    types = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternalUnknown];
+#pragma clang diagnostic pop
+  }
+  return [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:types mediaType:AVMediaTypeVideo
+                                                                  position:AVCaptureDevicePositionUnspecified].devices;
+}
+
+std::optional<Facing> CameraFacing(AVCaptureDevice* device) {
+  if (device.position == AVCaptureDevicePositionFront) return Facing::Front;
+  if (device.position == AVCaptureDevicePositionBack) return Facing::Back;
+  return {};
+}
+
+std::optional<std::string> CameraId(AVCaptureDevice* device) {
+  if (const char* id = device.uniqueID.UTF8String; id && *id) return std::string(id);
+  return {};
+}
+
+CameraDevicesResult EnumerateCameras() {
+  @autoreleasepool {
+    std::vector<CameraDevice> devices;
+    for (AVCaptureDevice* device in DiscoverCameras()) {
+      if (auto id = CameraId(device); id && device.isConnected) {
+        devices.push_back({std::move(*id), device.localizedName.UTF8String ?: "Camera", CameraFacing(device)});
+      }
+    }
+    return CameraDevicesResult::Success(std::move(devices));
+  }
+}
+
+AVCaptureDevice* CameraWithId(const std::string& id) {
+  for (AVCaptureDevice* device in DiscoverCameras()) {
+    if (device.isConnected && CameraId(device) == id) return device;
+  }
+  return nil;
+}
+
+std::optional<FrameRateRange> ReadFrameRate(AVCaptureDevice* device) {
+  const double shortest = CMTimeGetSeconds(device.activeVideoMinFrameDuration);
+  const double longest = CMTimeGetSeconds(device.activeVideoMaxFrameDuration);
+  if (shortest <= 0 || longest < shortest || !std::isfinite(shortest) || !std::isfinite(longest)) return {};
+  return FrameRateRange{1.0 / longest, 1.0 / shortest};
+}
+
+bool ConfigureCaptureFormat(AVCaptureDevice* device, const CapturePreferences& preferred) {
+  if (!preferred.pixel_width && !preferred.fps) return false;
+  AVCaptureDeviceFormat* selected = nil;
+  CMTime interval = kCMTimeInvalid;
+  std::tuple<double, double, double> best;
+  for (AVCaptureDeviceFormat* format in device.formats) {
+    if (![format.mediaType isEqualToString:AVMediaTypeVideo]) continue;
+    const auto size = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    if (size.width <= 0 || size.height <= 0) continue;
+    CaptureFormat candidate{static_cast<std::uint32_t>(size.width), static_cast<std::uint32_t>(size.height), {}};
+    if (!preferred.fps) {
+      const auto rank = CaptureFormatRank(preferred, candidate);
+      if (!selected || rank < best) {
+        selected = format;
+        best = rank;
+      }
+      continue;
+    }
+    for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
+      if (range.minFrameRate <= 0 || range.maxFrameRate < range.minFrameRate ||
+          !std::isfinite(range.minFrameRate) || !std::isfinite(range.maxFrameRate)) continue;
+      candidate.frame_rate = FrameRateRange{range.minFrameRate, range.maxFrameRate};
+      const auto rank = CaptureFormatRank(preferred, candidate);
+      if (selected && rank >= best) continue;
+      selected = format;
+      best = rank;
+      if (*preferred.fps <= range.minFrameRate) {
+        interval = range.maxFrameDuration;
+      } else if (*preferred.fps >= range.maxFrameRate) {
+        interval = range.minFrameDuration;
+      } else {
+        interval = CMTimeMakeWithSeconds(1.0 / *preferred.fps, 1'000'000'000);
+        if (CMTimeCompare(interval, range.minFrameDuration) < 0) interval = range.minFrameDuration;
+        if (CMTimeCompare(interval, range.maxFrameDuration) > 0) interval = range.maxFrameDuration;
+      }
+    }
+  }
+  if (!selected || ![device lockForConfiguration:nil]) return false;
+  @try {
+    device.activeFormat = selected;
+    if (CMTIME_IS_NUMERIC(interval) && interval.value > 0) {
+      @try {
+        device.activeVideoMinFrameDuration = interval;
+        device.activeVideoMaxFrameDuration = interval;
+      } @catch (NSException*) {
+        // Keep the selected size and let the device choose the frame rate.
+        device.activeVideoMinFrameDuration = kCMTimeInvalid;
+        device.activeVideoMaxFrameDuration = kCMTimeInvalid;
+      }
+    }
+    return true;
+  } @catch (NSException*) {
+    return false;
+  } @finally {
+    [device unlockForConfiguration];
+  }
+}
+
+CMClockRef SessionClock(AVCaptureSession* session) {
+  if (@available(macOS 12.3, *)) return session.synchronizationClock;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  return session.masterClock;
+#pragma clang diagnostic pop
+}
 
 CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIContext* context) {
   @autoreleasepool {
@@ -138,12 +268,27 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
   AVCaptureDevice* device_;
   NSMutableArray* observers_;
   std::shared_ptr<macos::PixelBufferTexture> texture_;
+  std::shared_ptr<FramePipeline> frames_;
+  FrameProducer producer_;
+  std::optional<ProcessedFrame> preview_;
+  std::optional<CaptureFormat> captureFormat_;
   std::optional<Facing> facing_;
-  std::function<void(CameraStatus)> changed_;
+  std::optional<std::string> deviceId_;
+  bool failed_;
+  CameraBackend::StatusCallback changed_;
+  std::function<void(PhotoFlash, std::optional<Torch>)> lightingChanged_;
 }
-- (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed;
+- (void)start:(std::optional<Facing>)facing deviceId:(std::optional<std::string>)deviceId
+    preferred:(CapturePreferences)preferred
+       frames:(std::shared_ptr<FramePipeline>)frames
+      changed:(CameraBackend::StatusCallback)changed;
 - (void)stop:(std::function<void()>)completed;
+- (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed;
+- (void)setTorchEnabled:(bool)enabled completed:(std::function<void(CameraResult<void>)>)completed;
+- (void)turnOffTorch;
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed;
+- (bool)supportsPointControl;
+- (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed;
 @end
 
 @implementation HUXCameraCapture
@@ -159,16 +304,24 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
 }
 
 - (void)fail:(CameraErrorCode)code message:(NSString*)message {
-  if (changed_) {
+  if (changed_ && !failed_) {
+    failed_ = true;
     changed_({.state = SessionState::Failed,
-              .error = CameraError{code, message.UTF8String ?: "Camera capture failed."}});
+              .error = CameraError{code, message.UTF8String ?: "Camera capture failed."}}, full_texture_crop);
   }
 }
 
-- (void)start:(std::optional<Facing>)facing changed:(std::function<void(CameraStatus)>)changed {
+- (void)start:(std::optional<Facing>)facing deviceId:(std::optional<std::string>)deviceId
+    preferred:(CapturePreferences)preferred
+       frames:(std::shared_ptr<FramePipeline>)frames
+      changed:(CameraBackend::StatusCallback)changed {
   dispatch_async(queue_, ^{
     changed_ = changed;
-    if (!facing) {
+    frames_ = frames;
+    failed_ = false;
+    if (deviceId) {
+      device_ = CameraWithId(*deviceId);
+    } else if (!facing) {
       device_ = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
     } else {
       const AVCaptureDevicePosition position = *facing == Facing::Front ? AVCaptureDevicePositionFront :
@@ -183,19 +336,19 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
         }
       }
     }
-    if (!device_) {
-      [self fail:CameraErrorCode::DeviceNotFound message:@"No camera matches the requested facing."];
+    if (!device_.isConnected) {
+      [self fail:CameraErrorCode::DeviceNotFound message:@"No camera matches the requested selection."];
       return;
     }
-    facing_.reset();
-    if (device_.position == AVCaptureDevicePositionFront) {
-      facing_ = Facing::Front;
-    } else if (device_.position == AVCaptureDevicePositionBack) {
-      facing_ = Facing::Back;
-    }
+    facing_ = CameraFacing(device_);
+    deviceId_ = CameraId(device_);
     NSError* error = nil;
     AVCaptureDeviceInput* input = [AVCaptureDeviceInput deviceInputWithDevice:device_ error:&error];
     if (!input) {
+      if (!device_.isConnected) {
+        [self fail:CameraErrorCode::DeviceNotFound message:@"The selected camera is no longer connected."];
+        return;
+      }
       const auto code = error.code == AVErrorDeviceInUseByAnotherApplication ? CameraErrorCode::DeviceBusy :
                                                                              CameraErrorCode::ConfigurationFailed;
       [self fail:code message:error.localizedDescription];
@@ -236,6 +389,7 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     } else {
       photoOutput_ = nil;
     }
+    ConfigureCaptureFormat(device_, preferred);
     [output_ setSampleBufferDelegate:self queue:queue_];
     [session_ commitConfiguration];
     __weak HUXCameraCapture* weak = self;
@@ -249,7 +403,9 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       NSError* runtimeError = notification.userInfo[AVCaptureSessionErrorKey];
       dispatch_async(capture->queue_, ^{
         if (notification.object == capture->session_) {
-          [capture fail:CameraErrorCode::CaptureFailed message:runtimeError.localizedDescription];
+          const auto code = runtimeError.code == AVErrorDeviceWasDisconnected || !capture->device_.isConnected
+              ? CameraErrorCode::DeviceDisconnected : CameraErrorCode::CaptureFailed;
+          [capture fail:code message:runtimeError.localizedDescription];
         }
       });
     }]];
@@ -269,13 +425,13 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       [self fail:CameraErrorCode::CaptureFailed message:@"The camera did not start."];
       return;
     }
-    changed_({.state = SessionState::Running, .actual_facing = facing_});
+    changed_({.state = SessionState::Running, .actual_facing = facing_, .actual_device_id = deviceId_}, full_texture_crop);
   });
 }
 
 - (void)captureOutput:(AVCaptureOutput*)output didOutputSampleBuffer:(CMSampleBufferRef)sample
        fromConnection:(AVCaptureConnection*)connection {
-  if (output != output_ || !changed_) {
+  if (output != output_ || !changed_ || failed_) {
     return;
   }
   CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
@@ -283,28 +439,203 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     return;
   }
   try {
-    const huxerui::Size size{static_cast<float>(CVPixelBufferGetWidth(buffer)),
-                    static_cast<float>(CVPixelBufferGetHeight(buffer))};
-    const bool replaced = !texture_ || texture_->IntrinsicSize() != size;
-    if (replaced) {
+    const auto width = static_cast<std::uint32_t>(CVPixelBufferGetWidth(buffer));
+    const auto height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(buffer));
+    const huxerui::Size size{static_cast<float>(width), static_cast<float>(height)};
+    if (!texture_ || texture_->IntrinsicSize() != size) {
+      producer_.processor = {};
       if (texture_) {
         texture_->Finish();
       }
       texture_ = std::make_shared<macos::PixelBufferTexture>(size);
     }
     texture_->Publish(buffer);
-    if (replaced) {
-      changed_({.state = SessionState::Running, .actual_facing = facing_,
-                .preview = PreviewOutput{.texture = texture_, .mirrored = static_cast<bool>(connection.videoMirrored)}});
+    ProcessedFrame frame{.output = {.texture = texture_, .mirrored = static_cast<bool>(connection.videoMirrored)}};
+    if (frames_) {
+      const auto time = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1'000'000'000,
+                                          kCMTimeRoundingMethod_Default);
+      if (!CMTIME_IS_NUMERIC(time)) return;
+      std::optional<std::chrono::nanoseconds> synchronized_time;
+      if (const auto clock = SessionClock(session_)) {
+        const auto host = CMSyncConvertTime(time, clock, CMClockGetHostTimeClock());
+        const auto timestamp = CMTimeConvertScale(host, 1'000'000'000, kCMTimeRoundingMethod_Default);
+        if (CMTIME_IS_NUMERIC(timestamp)) synchronized_time = std::chrono::nanoseconds(timestamp.value);
+      }
+      auto processed = frames_->Process(producer_, std::move(frame.output), std::chrono::nanoseconds(time.value),
+                                        width, height, synchronized_time);
+      if (!processed.Succeeded()) {
+        failed_ = true;
+        changed_({.state = SessionState::Failed, .error = processed.Error()}, full_texture_crop);
+        return;
+      }
+      frame = std::move(processed).Value();
+    }
+    const CaptureFormat capture_format{width, height, ReadFrameRate(device_)};
+    if (frame.output.texture && (frame != preview_ || capture_format != captureFormat_)) {
+      preview_ = std::move(frame);
+      captureFormat_ = capture_format;
+      changed_({.state = SessionState::Running, .actual_facing = facing_, .preview = preview_->output,
+                .can_focus_and_meter = [self supportsPointControl], .capture_format = captureFormat_,
+                .actual_device_id = deviceId_}, preview_->source_crop);
     }
   } catch (const std::exception& error) {
     [self fail:CameraErrorCode::CaptureFailed message:[NSString stringWithUTF8String:error.what()]];
   }
 }
 
+- (bool)supportsPointControl {
+  return (device_.isFocusPointOfInterestSupported &&
+          [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) ||
+         (device_.isExposurePointOfInterestSupported &&
+          [device_ isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]);
+}
+
+- (void)focusAndMeter:(huxerui::Point)point completed:(std::function<void(CameraResult<void>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!device_ || !changed_ || !session_.isRunning || failed_ || !preview_) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera preview is not ready."}));
+      return;
+    }
+    if (![self supportsPointControl]) {
+      completed(CameraResult<void>::Failure(
+          {CameraErrorCode::Unavailable, "Point focus and metering are unavailable."}));
+      return;
+    }
+    NSError* error = nil;
+    if (![device_ lockForConfiguration:&error]) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+          error.localizedDescription.UTF8String ?: "Cannot configure camera focus."}));
+      return;
+    }
+    NSString* failure = nil;
+    @try {
+      const CGPoint target = CGPointMake(preview_->output.mirrored ? 1.0F - point.x : point.x, point.y);
+      if (device_.isFocusPointOfInterestSupported &&
+          [device_ isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]) {
+        device_.focusPointOfInterest = target;
+        device_.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+      }
+      if (device_.isExposurePointOfInterestSupported &&
+          [device_ isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure]) {
+        device_.exposurePointOfInterest = target;
+        device_.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+      }
+    } @catch (NSException* exception) {
+      failure = exception.reason ?: @"Cannot apply camera focus and metering.";
+    } @finally {
+      [device_ unlockForConfiguration];
+    }
+    if (failure) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::CaptureFailed, failure.UTF8String}));
+    } else {
+      completed(CameraResult<void>::Success());
+    }
+  });
+}
+
+- (PhotoFlash)photoFlash {
+  if (@available(macOS 13.0, *)) {
+    NSArray<NSNumber*>* modes = photoOutput_.supportedFlashModes;
+    return {.supports_auto = [modes containsObject:@(AVCaptureFlashModeAuto)] == YES,
+            .supports_on = [modes containsObject:@(AVCaptureFlashModeOn)] == YES};
+  }
+  return {};
+}
+
+- (std::optional<Torch>)torch {
+  if (!device_.hasTorch || ![device_ isTorchModeSupported:AVCaptureTorchModeOn] ||
+      ![device_ isTorchModeSupported:AVCaptureTorchModeOff]) return {};
+  return Torch{.available = device_.isTorchAvailable == YES, .enabled = device_.isTorchActive == YES};
+}
+
+- (void)publishLighting {
+  if (lightingChanged_ && changed_ && session_.isRunning && !failed_) {
+    lightingChanged_([self photoFlash], [self torch]);
+  }
+}
+
+- (void)observeLighting:(std::function<void(PhotoFlash, std::optional<Torch>)>)changed {
+  dispatch_async(queue_, ^{
+    if (!changed_ || !session_.isRunning || failed_) return;
+    if (!lightingChanged_) {
+      if (device_.hasTorch) {
+        [device_ addObserver:self forKeyPath:@"torchAvailable" options:0 context:&lighting_observation];
+        [device_ addObserver:self forKeyPath:@"torchActive" options:0 context:&lighting_observation];
+      }
+      if (@available(macOS 13.0, *)) {
+        [photoOutput_ addObserver:self forKeyPath:@"supportedFlashModes" options:0 context:&lighting_observation];
+      }
+    }
+    lightingChanged_ = changed;
+    [self publishLighting];
+  });
+}
+
+- (void)observeValueForKeyPath:(NSString*)keyPath ofObject:(id)object
+                       change:(NSDictionary<NSKeyValueChangeKey, id>*)change context:(void*)context {
+  if (context != &lighting_observation) {
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    return;
+  }
+  dispatch_async(queue_, ^{
+    if (object == device_ || object == photoOutput_) [self publishLighting];
+  });
+}
+
+- (CameraResult<void>)applyTorchEnabled:(bool)enabled {
+  const auto torch = [self torch];
+  if (!torch || (enabled && !torch->available)) {
+    return CameraResult<void>::Failure({CameraErrorCode::Unavailable, "The camera torch is unavailable."});
+  }
+  NSError* error = nil;
+  if (![device_ lockForConfiguration:&error]) {
+    return CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+        error.localizedDescription.UTF8String ?: "Cannot configure the camera torch."});
+  }
+  @try {
+    device_.torchMode = enabled ? AVCaptureTorchModeOn : AVCaptureTorchModeOff;
+  } @catch (NSException* exception) {
+    return CameraResult<void>::Failure({CameraErrorCode::CaptureFailed,
+        exception.reason.UTF8String ?: "Cannot change the camera torch."});
+  } @finally {
+    [device_ unlockForConfiguration];
+  }
+  return CameraResult<void>::Success();
+}
+
+- (void)setTorchEnabled:(bool)enabled completed:(std::function<void(CameraResult<void>)>)completed {
+  dispatch_async(queue_, ^{
+    if (!changed_ || !session_.isRunning || failed_) {
+      completed(CameraResult<void>::Failure({CameraErrorCode::NotReady, "The camera is not running."}));
+      return;
+    }
+    auto result = [self applyTorchEnabled:enabled];
+    [self publishLighting];
+    completed(std::move(result));
+  });
+}
+
+- (void)stopObservingLighting {
+  if (!lightingChanged_) return;
+  if (device_.hasTorch) {
+    [device_ removeObserver:self forKeyPath:@"torchAvailable" context:&lighting_observation];
+    [device_ removeObserver:self forKeyPath:@"torchActive" context:&lighting_observation];
+  }
+  if (@available(macOS 13.0, *)) {
+    [photoOutput_ removeObserver:self forKeyPath:@"supportedFlashModes" context:&lighting_observation];
+  }
+  lightingChanged_ = {};
+}
+
+- (void)turnOffTorch {
+  if (device_.torchMode != AVCaptureTorchModeOff) {
+    CAMERA_UNUSED([self applyTorchEnabled:false]);
+  }
+}
+
 - (void)capturePhoto:(PhotoOptions)options completed:(std::function<void(CameraResult<ImageAsset>)>)completed {
   dispatch_async(queue_, ^{
-    if (!changed_ || !session_.isRunning) {
+    if (!changed_ || !session_.isRunning || failed_) {
       completed(
           CameraResult<ImageAsset>::Failure({CameraErrorCode::NotReady, "Start the camera before taking a photo."}));
       return;
@@ -318,6 +649,15 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       completed(CameraResult<ImageAsset>::Failure(
           {CameraErrorCode::Unavailable, "This camera cannot combine preview and still photos."}));
       return;
+    }
+    if (options.flash_mode != FlashMode::Off) {
+      const auto flash = [self photoFlash];
+      const bool supported = options.flash_mode == FlashMode::Auto ? flash.supports_auto : flash.supports_on;
+      if (!supported || !device_.isFlashAvailable || device_.torchMode == AVCaptureTorchModeOn) {
+        completed(CameraResult<ImageAsset>::Failure(
+            {CameraErrorCode::Unavailable, "The requested flash mode is unavailable."}));
+        return;
+      }
     }
     AVCaptureConnection* connection = [photoOutput_ connectionWithMediaType:AVMediaTypeVideo];
     if (connection.isVideoMirroringSupported) {
@@ -347,6 +687,11 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
     @try {
       AVCapturePhotoSettings* settings =
           [AVCapturePhotoSettings photoSettingsWithFormat:@{AVVideoCodecKey : AVVideoCodecTypeJPEG}];
+      if (@available(macOS 13.0, *)) {
+        if (options.flash_mode != FlashMode::Off) {
+          settings.flashMode = options.flash_mode == FlashMode::Auto ? AVCaptureFlashModeAuto : AVCaptureFlashModeOn;
+        }
+      }
       [photoOutput_ capturePhotoWithSettings:settings delegate:photo_];
     } @catch (NSException* exception) {
       finish(CameraResult<ImageAsset>::Failure(
@@ -365,14 +710,22 @@ CameraResult<ImageAsset> EncodePhoto(NSData* data, PhotoOptions options, CIConte
       [NSNotificationCenter.defaultCenter removeObserver:observer];
     }
     [observers_ removeAllObjects];
+    [self stopObservingLighting];
+    [self turnOffTorch];
     [output_ setSampleBufferDelegate:nil queue:nullptr];
     [session_ stopRunning];
+    producer_.processor = {};
+    producer_.resizer.Reset();
     output_ = nil;
     device_ = nil;
     if (texture_) {
       texture_->Finish();
       texture_.reset();
     }
+    preview_.reset();
+    captureFormat_.reset();
+    deviceId_.reset();
+    frames_.reset();
     [self completeStops];
   });
 }
@@ -396,11 +749,17 @@ class AppleCamera final : public CameraBackend {
 public:
   explicit AppleCamera(NSWindow* window)
       : capture_([HUXCameraCapture new]), screen_(CreateMacScreenCamera(window)) {}
-  void Start(std::optional<Facing> facing, std::function<void(CameraStatus)> changed) override {
-    screen_active_ = false;
-    [capture_ start:facing changed:std::move(changed)];
+  Task<CameraDevicesResult> EnumerateDevices() override {
+    co_return co_await RunWorker(&EnumerateCameras);
   }
-  void StartScreen(std::function<void(CameraStatus)> changed) override {
+
+  void Start(std::optional<Facing> facing, std::optional<std::string> device_id,
+             CapturePreferences preferred, StatusCallback changed) override {
+    screen_active_ = false;
+    [capture_ start:facing deviceId:std::move(device_id) preferred:preferred
+              frames:frame_pipeline_ changed:std::move(changed)];
+  }
+  void StartScreen(StatusCallback changed) override {
     screen_active_ = true;
     screen_->StartScreen(std::move(changed));
   }
@@ -411,6 +770,16 @@ public:
     if (screen_active_) screen_->Stop(std::move(completed));
     else [capture_ stop:std::move(completed)];
   }
+  void ObserveLighting(std::function<void(PhotoFlash, std::optional<Torch>)> changed) override {
+    [capture_ observeLighting:std::move(changed)];
+  }
+  void SetTorchEnabled(bool enabled, std::function<void(CameraResult<void>)> completed) override {
+    [capture_ setTorchEnabled:enabled completed:std::move(completed)];
+  }
+  void FocusAndMeter(Point point, std::function<void(CameraResult<void>)> completed) override {
+    [capture_ focusAndMeter:point completed:std::move(completed)];
+  }
+
   void CapturePhoto(PhotoOptions options, std::function<void(CameraResult<ImageAsset>)> completed) override {
     if (screen_active_) screen_->CapturePhoto(options, std::move(completed));
     else [capture_ capturePhoto:options completed:std::move(completed)];
