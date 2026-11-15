@@ -857,7 +857,6 @@ View ScanPanel(State<ScanState> scan, bool live, bool available, std::function<v
     Label(live ? "Scanning the live preview" : "Camera is not running", 14.0F, foreground, FontWeight::Medium),
     scan->error.empty() ? View() : Label(scan->error, 12.0F, Color::Rgb(255, 162, 156)),
     Row {
-      Label("QR codes are decoded locally with Lib-QRCode.", 12.0F, secondary),
       Spacer(),
       Button(live ? "Restart scan" : "Start camera")
           .OnClick([scan, live, retry = std::move(retry)] {
