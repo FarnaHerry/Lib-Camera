@@ -325,7 +325,7 @@ Select **Camera**, **Screen**, or **Scan** above the capture controls to switch 
 
 **Scan** keeps the live camera preview, captures preview frames periodically, and decodes the first QR code with `Lib-QRCode`. The decoded payload and **Scan again** appear below the viewfinder. Linux decodes camera JPEGs through gdk-pixbuf, Windows through WIC, Apple platforms through ImageIO, and Android through a `BitmapFactory` platform module; the decoded pixels are handed to `Lib-QRCode` in all cases. Scanning is unavailable on Web.
 
-Building the example also requires a `Lib-QRCode` checkout. Place it beside `Lib-Camera` or set `HUXERUI_QRCODE_PATH`. This is an example-only dependency; the Camera library itself does not link it.
+The example fetches `Lib-QRCode` from its pinned upstream commit through `huxerui_use_library(URL, COMMIT)`; no local checkout is required. Override `LIB_QRCODE_COMMIT` or `LIB_QRCODE_URL` to test another revision. This is an example-only dependency; the Camera library itself does not link it.
 
 On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 
