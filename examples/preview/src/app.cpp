@@ -803,10 +803,7 @@ View OpaqueSheet(State<bool> presented, View content) {
   return content;
 }
 
-View ScanEffect() {
-  const Animated<Point> sweep = AnimateTo(
-      Point{0.0F, 220.0F}, TweenSpec{1.7, Easing::Linear},
-      AnimationPlayback{.iterations = std::nullopt, .repeat_mode = RepeatMode::Restart});
+View ScanEffect(float offset) {
   return Stack {
     Canvas([](PaintContext& paint, Size size) {
       constexpr float box = 240.0F;
@@ -831,13 +828,13 @@ View ScanEffect() {
     Stack {
       Canvas([](PaintContext& paint, Size size) {
         paint.DrawRect({0.0F, 0.0F, size.width, size.height}, accent);
-      }).With(Frame{.width = 220.0F, .height = 2.0F}, CornerRadius(1.0F)).With(Offset(sweep)),
+      }).With(Frame{.width = 220.0F, .height = 2.0F}, CornerRadius(1.0F)).With(Offset(Point{0.0F, offset})),
     }.With(Frame{.width = 240.0F, .height = 240.0F},
            Align(HorizontalAlignment::Center, VerticalAlignment::Start)),
   }.With(Grow(), Align(HorizontalAlignment::Center, VerticalAlignment::Center));
 }
 
-View ScanOverlay(State<ScanState> scan, bool live) {
+View ScanOverlay(State<ScanState> scan, bool live, float offset) {
   const char* status = !live ? "Camera is not running"
       : scan->error.empty() ? "Point the camera at a QR code"
       : "Scanning failed";
@@ -955,6 +952,7 @@ View CameraWorkspace() {
   auto active = UseState(false);
   auto workspace = UseState(Workspace::Camera);
   auto scan = UseState(ScanState{});
+  auto scan_line = UseState(0.0F);
   auto scan_choices = UseState(std::vector<ScanCandidate>{});
   auto scan_result = UseState(std::optional<ScanCandidate>{});
   auto qr_decoder = UseState(QrDecoderHandle{});
@@ -1402,7 +1400,7 @@ View CameraWorkspace() {
   } else if (scan_mode) {
     viewfinder = Stack {
       std::move(viewfinder),
-      ScanOverlay(scan, live),
+      ScanOverlay(scan, live, scan_line.Get()),
     }.With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
   }
 
