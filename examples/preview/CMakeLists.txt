@@ -60,13 +60,15 @@ huxerui_use_library(example_camera
         PATH "${HUXERUI_QRCODE_PATH}"
 )
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(HUXERUI_EXAMPLE_GDK_PIXBUF REQUIRED IMPORTED_TARGET gdk-pixbuf-2.0)
-    target_link_libraries(example_camera PRIVATE PkgConfig::HUXERUI_EXAMPLE_GDK_PIXBUF)
-elseif (WIN32)
-    target_link_libraries(example_camera PRIVATE windowscodecs ole32)
-elseif (APPLE)
-    target_link_libraries(example_camera PRIVATE
-            "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(HUXERUI_EXAMPLE_GDK_PIXBUF REQUIRED IMPORTED_TARGET gdk-pixbuf-2.0)
+        target_link_libraries(example_camera PRIVATE PkgConfig::HUXERUI_EXAMPLE_GDK_PIXBUF)
+    elseif (WIN32)
+        target_link_libraries(example_camera PRIVATE windowscodecs ole32)
+    elseif (APPLE)
+        target_link_libraries(example_camera PRIVATE
+                "-framework ImageIO" "-framework CoreGraphics" "-framework CoreFoundation")
+    endif ()
 endif ()
