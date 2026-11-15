@@ -62,14 +62,16 @@ int ScaledDimension(int value, double scale) {
 
 ScanOutcome DecodePixels(const DecodedPixels& pixels) {
   try {
-    const auto result = qrcode::Decode(
+    const auto results = qrcode::DecodeAll(
         ImageView{std::span<const std::uint8_t>(pixels.bytes), pixels.width, pixels.height, pixels.format,
                   pixels.width * 4},
-        DecodeOptions{.formats = {BarcodeFormat::QRCode}});
-    if (!result) {
-      return {};
+        DecodeOptions{.formats = {BarcodeFormat::QRCode}, .max_symbols = 8});
+    ScanOutcome outcome;
+    outcome.candidates.reserve(results.size());
+    for (const auto& result : results) {
+      outcome.candidates.push_back({.text = result.text, .format = "QR Code"});
     }
-    return {.text = result->text, .format = "QR Code"};
+    return outcome;
   } catch (const std::exception& error) {
     return {.error = error.what()};
   }
