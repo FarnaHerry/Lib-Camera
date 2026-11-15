@@ -3,6 +3,8 @@
 #include <huxerui/camera.h>
 #include <app_resources.h>
 
+#include "qr_scan.h"
+
 #if defined(__ANDROID__)
 #include <huxerui/android/platform_registry.h>
 #endif
@@ -20,6 +22,11 @@ using namespace huxerui;
 
 namespace {
 
+using app::OpenQrDecoder;
+using app::QrDecoderHandle;
+using app::QrScanningAvailable;
+using app::ScanQrFromJpeg;
+
 const Color background = Color::Rgb(15, 18, 22);
 const Color surface = Color::Rgb(24, 28, 33);
 const Color control_background = Color::Rgb(34, 40, 47);
@@ -33,6 +40,7 @@ const Color camera_yellow = Color::Rgb(255, 215, 78);
 
 enum class CaptureMode { Photo, Video };
 enum class VideoPhase { Idle, Authorizing, Starting, Recording, Finishing };
+enum class Workspace { Camera, Screen, Scan };
 
 Text Label(StringVariant text, float size = 13.0F, Color color = secondary,
            FontWeight weight = FontWeight::Regular) {
@@ -320,6 +328,14 @@ struct ViewfinderSelection {
   bool adjusting_exposure = false;
 
   bool operator==(const ViewfinderSelection&) const = default;
+};
+
+struct ScanState {
+  std::uint64_t generation = 0;
+  bool found = false;
+  std::string text;
+  std::string format;
+  std::string error;
 };
 
 struct ExposureControlState {
@@ -789,10 +805,50 @@ View OpaqueSheet(State<bool> presented, View content) {
   return content;
 }
 
+View ScanOverlay(State<ScanState> scan, bool live) {
+  const char* status = scan->found ? "QR code found"
+      : !live ? "Camera is not running"
+      : scan->error.empty() ? "Point the camera at a QR code"
+      : "Scanning failed";
+  return Column {
+    Spacer(),
+    Label(status, 13.0F, foreground, FontWeight::SemiBold)
+        .With(Padding(EdgeInsets::Symmetric(14.0F, 10.0F)), Background(overlay_background), CornerRadius(10.0F)),
+    Spacer(),
+  }.With(MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center));
+}
+
+View ScanPanel(State<ScanState> scan, bool live, bool available, std::function<void()> retry) {
+  if (!available) {
+    return Label("QR scanning is unavailable on this platform.", 13.0F, secondary);
+  }
+  return Column {
+    Label(scan->found ? "QR code found" : live ? "Scanning the live preview" : "Camera is not running",
+          14.0F, foreground, FontWeight::Medium),
+    scan->text.empty() ? View() : View(Label(scan->text, 14.0F, foreground))
+        .With(Padding(12.0F), Background(surface), Border(outline, 1.0F), CornerRadius(12.0F)),
+    scan->error.empty() ? View() : Label(scan->error, 12.0F, Color::Rgb(255, 162, 156)),
+    Row {
+      Label(scan->found ? scan->format : "QR codes are decoded locally with Lib-QRCode.", 12.0F, secondary),
+      Spacer(),
+      Button(scan->found ? "Scan again" : live ? "Restart scan" : "Start camera")
+          .OnClick([scan, live, retry = std::move(retry)] {
+            if (!live) {
+              retry();
+              return;
+            }
+            scan = ScanState{.generation = scan->generation + 1};
+          }),
+    }.With(CrossAlign(CrossAxisAlignment::Center), Spacing(12.0F)),
+  }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
 [[huxerui::composable]]
 View CameraWorkspace() {
   auto active = UseState(false);
-  auto source = UseState(camera::CaptureSource::Camera);
+  auto workspace = UseState(Workspace::Camera);
+  auto scan = UseState(ScanState{});
+  auto qr_decoder = UseState(QrDecoderHandle{});
   auto mode = UseState(CaptureMode::Photo);
   auto flash_mode = UseState(camera::FlashMode::Off);
   auto changing_torch = UseState(false);
@@ -821,6 +877,13 @@ View CameraWorkspace() {
   auto picker = UseService<FilePicker>();
   auto tasks = UseTaskScope();
   auto sheets = UseBottomSheet();
+  Lifecycle([qr_decoder] {
+    qr_decoder = OpenQrDecoder();
+    return [qr_decoder] { qr_decoder = QrDecoderHandle{}; };
+  });
+  const bool screen_mode = workspace == Workspace::Screen;
+  const bool scan_mode = workspace == Workspace::Scan;
+  const camera::CaptureSource source = screen_mode ? camera::CaptureSource::Screen : camera::CaptureSource::Camera;
   const std::size_t resolution = capture_resolution;
   const std::size_t frame_rate = capture_frame_rate;
   constexpr std::uint32_t widths[]{0, 1280, 1920};
@@ -844,7 +907,6 @@ View CameraWorkspace() {
   const ImageFit selected_fit = fit;
   const bool expanded = UseViewportClass() == ViewportClass::Expanded;
   const camera::PreviewOptions preview_options{.fit = selected_fit, .mirror = mirror};
-  const bool screen_mode = source == camera::CaptureSource::Screen;
   const bool live = status.state == camera::SessionState::Running && (screen_mode || status.preview.has_value());
   const auto texture = status.preview ? status.preview->texture : nullptr;
   const auto rotation = status.preview ? status.preview->rotation : camera::PreviewRotation::R0;
@@ -907,9 +969,9 @@ View CameraWorkspace() {
     });
   };
 
-  auto start_camera = [active, source, authorizing, permission_error, application, tasks, session] {
+  auto start_camera = [active, workspace, authorizing, permission_error, application, tasks, session] {
     if (authorizing) return;
-    if (source.Get() == camera::CaptureSource::Screen) {
+    if (workspace.Get() == Workspace::Screen) {
       // Screen selection does not use camera permission.
       permission_error = std::string{};
       if (active) session.Retry();
@@ -1062,6 +1124,44 @@ View CameraWorkspace() {
     });
   };
 
+  Lifecycle([scan_mode, live, tasks, session, scan, qr_decoder] {
+    TaskHandle loop;
+    if (scan_mode && live && QrScanningAvailable()) {
+      const auto generation = scan->generation;
+      loop = tasks.Launch([session, scan, qr_decoder, generation]() -> Task<void> {
+        while (session.Status().state == camera::SessionState::Running &&
+               scan->generation == generation && !scan->found) {
+          const auto image = co_await session.CapturePreviewFrameAsync({.jpeg_quality = 70});
+          if (scan->generation != generation) co_return;
+          if (image.Succeeded()) {
+            const auto encoded = image.Value().EncodedBytes();
+            auto outcome = co_await ScanQrFromJpeg(Bytes(encoded.begin(), encoded.end()), qr_decoder.Get());
+            if (scan->generation != generation) co_return;
+            if (!outcome.text.empty()) {
+              auto text = std::move(outcome.text);
+              auto format = std::move(outcome.format);
+              scan.Update([&](ScanState& value) {
+                value.text = std::move(text);
+                value.format = std::move(format);
+                value.found = true;
+                value.error.clear();
+              });
+              co_return;
+            }
+            scan.Update([&](ScanState& value) { value.error = std::move(outcome.error); });
+          } else if (image.Error().code == camera::CameraErrorCode::Interrupted) {
+            co_return;
+          } else {
+            const auto message = image.Error().message;
+            scan.Update([&](ScanState& value) { value.error = message; });
+          }
+          co_await Delay(std::chrono::milliseconds(700));
+        }
+      });
+    }
+    return [loop] { loop.Cancel(); };
+  }, scan_mode, live, scan->generation);
+
   const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
   View badge = recording || phase == VideoPhase::Finishing
       ? RecordingBadge(session, recording && live, paused)
@@ -1147,7 +1247,7 @@ View CameraWorkspace() {
       Row {
         badge,
         Spacer(),
-        live && !screen_mode ? View(IconButton(app::images::camera, "Capture the current frame").OnClick(snapshot_frame)
+        live && !screen_mode && !scan_mode ? View(IconButton(app::images::camera, "Capture the current frame").OnClick(snapshot_frame)
             .With(Enabled(!status.capturing_photo), Background(overlay_background), CornerRadius(14.0F))) : View(),
         std::move(light_control),
         IconButton(app::images::settings, "Preview settings").OnClick(show_settings)
@@ -1192,6 +1292,11 @@ View CameraWorkspace() {
         Border(accent, 2.0F),
         Background(Color::Black())
     );
+  } else if (scan_mode) {
+    viewfinder = Stack {
+      std::move(viewfinder),
+      ScanOverlay(scan, live),
+    }.With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
   }
 
   const char* photo_action = status.capturing_photo ? "Taking photo" : "Take photo";
@@ -1220,33 +1325,46 @@ View CameraWorkspace() {
       : IconButton(app::images::photo, "View last photo").OnClick(show_photo).With(Enabled(photo->HasValue())))
       .With(Background(control_background), CornerRadius(14.0F));
 
+  View action_area;
+  if (scan_mode) {
+    action_area = ScanPanel(scan, live, QrScanningAvailable(), start_camera);
+  } else {
+    action_area = Column {
+      video_file->has_value() && picker->CanSaveFiles() ? View(Button(saving_video ? "Saving video" : "Save video")
+          .OnClick(save_video).With(Enabled(!saving_video && !video_busy))) : View(),
+      video_message->empty() ? View() : View(Label(video_message.Get(), 12.0F)),
+      photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
+      torch_error->empty() ? View() : View(Label(torch_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
+      CaptureModePicker(mode, workspace == Workspace::Camera && !video_busy &&
+                               !status.capturing_photo && !changing_torch),
+      Stack {
+        Row {
+          left_control,
+          Spacer(),
+          primary,
+          Spacer(),
+          IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, device_id, status] {
+            const auto current = status.actual_facing ? status.actual_facing : facing.Get();
+            device_id = std::nullopt;
+            facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
+          }).With(Enabled(workspace == Workspace::Camera && !authorizing && !stopping),
+                  Background(control_background), CornerRadius(14.0F)),
+        }.With(Frame{.width = 288.0F}, CrossAlign(CrossAxisAlignment::Center)),
+      }.With(Frame{.height = 68.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center)),
+    }.With(Spacing(8.0F));
+  }
+
   View controls = Column {
-    video_file->has_value() && picker->CanSaveFiles() ? View(Button(saving_video ? "Saving video" : "Save video")
-        .OnClick(save_video).With(Enabled(!saving_video && !video_busy))) : View(),
-    video_message->empty() ? View() : View(Label(video_message.Get(), 12.0F)),
-    photo_error->empty() ? View() : View(Label(photo_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
-    torch_error->empty() ? View() : View(Label(torch_error.Get(), 12.0F, Color::Rgb(255, 162, 156))),
-    SegmentedButton({"Camera", "Screen"}, source == camera::CaptureSource::Camera ? 0 : 1)
-        .OnChanged([source, mode](std::size_t index) {
-          source = index == 0 ? camera::CaptureSource::Camera : camera::CaptureSource::Screen;
-          if (source == camera::CaptureSource::Screen) mode = CaptureMode::Photo;
+    SegmentedButton({"Camera", "Screen", "Scan"},
+                    workspace == Workspace::Camera ? 0 : workspace == Workspace::Screen ? 1 : 2)
+        .OnChanged([workspace, mode, scan](std::size_t index) {
+          workspace = index == 0 ? Workspace::Camera : index == 1 ? Workspace::Screen : Workspace::Scan;
+          if (workspace != Workspace::Camera) mode = CaptureMode::Photo;
+          if (workspace == Workspace::Scan) {
+            scan = ScanState{.generation = scan->generation + 1};
+          }
         }),
-    CaptureModePicker(mode, source == camera::CaptureSource::Camera && !video_busy &&
-                             !status.capturing_photo && !changing_torch),
-    Stack {
-      Row {
-        left_control,
-        Spacer(),
-        primary,
-        Spacer(),
-        IconButton(app::images::flip, "Switch front and rear camera").OnClick([facing, device_id, status] {
-          const auto current = status.actual_facing ? status.actual_facing : facing.Get();
-          device_id = std::nullopt;
-          facing = current == camera::Facing::Front ? camera::Facing::Back : camera::Facing::Front;
-        }).With(Enabled(source == camera::CaptureSource::Camera && !authorizing && !stopping),
-                Background(control_background), CornerRadius(14.0F)),
-      }.With(Frame{.width = 288.0F}, CrossAlign(CrossAxisAlignment::Center)),
-    }.With(Frame{.height = 68.0F}, Align(HorizontalAlignment::Center, VerticalAlignment::Center)),
+    action_area,
   }.With(
       Spacing(8.0F),
       Padding(EdgeInsets::Symmetric(16.0F, 8.0F)),
@@ -1332,6 +1450,7 @@ const Application application{
         .application_hooks = {
             huxerui::camera::Install,
             huxerui::audio::Install,
+            app::InstallQrScanning,
 #if defined(__ANDROID__)
             [](ApplicationContext& context) {
               android::JavaPlatformModuleFactory<std::shared_ptr<PhotoThumbnail>> factory;

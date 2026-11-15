@@ -321,7 +321,11 @@ Replace `android` with `ios`, `macos`, or `windows` as needed. For Android, use 
 
 The example opens in **PHOTO** and starts the preview automatically after camera access is granted. The viewfinder fills the window above the capture controls, with **Preview settings** in the upper corner. Tap or swipe the **PHOTO** and **VIDEO** labels to choose a capture mode. In **PHOTO**, press the white shutter to capture and use the photo icon to review or save the latest image. In **VIDEO**, press the red shutter and allow microphone access to start recording. The recording badge shows the recorded video duration in whole seconds. Use the control to the left of the shutter to pause or resume. Press the shutter again to finalize the MP4 with microphone audio, then select **Save video** to export it to a location you choose in the system file picker. You can retry if you dismiss the picker. A failed camera session offers **Try again**.
 
-Select **Camera** or **Screen** above the capture mode to switch between camera capture and the transparent desktop aperture.
+Select **Camera**, **Screen**, or **Scan** above the capture controls to switch between camera capture, the transparent desktop aperture, and QR scanning.
+
+**Scan** keeps the live camera preview, captures preview frames periodically, and decodes the first QR code with `Lib-QRCode`. The decoded payload and **Scan again** appear below the viewfinder. Linux decodes camera JPEGs through gdk-pixbuf, Windows through WIC, Apple platforms through ImageIO, and Android through a `BitmapFactory` platform module; the decoded pixels are handed to `Lib-QRCode` in all cases. Scanning is unavailable on Web.
+
+Building the example also requires a `Lib-QRCode` checkout. Place it beside `Lib-Camera` or set `HUXERUI_QRCODE_PATH`. This is an example-only dependency; the Camera library itself does not link it.
 
 On Windows, the backend uses Media Foundation capture and D3D11 preview textures. Camera facing comes from device enclosure metadata; external cameras may have unknown facing and should use the default selection. Still photos use the Capture Engine photo output and WIC to normalize orientation and JPEG quality.
 
