@@ -51,13 +51,16 @@ huxerui_use_library(example_camera
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 
-set(HUXERUI_QRCODE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../Lib-QRCode"
-        CACHE PATH "Lib-QRCode source checkout required by the scan demo")
+set(LIB_QRCODE_URL "https://github.com/HuxerUI/Lib-QRCode.git"
+        CACHE STRING "Lib-QRCode repository required by the scan demo")
+set(LIB_QRCODE_COMMIT "4f67b7a1b60d459a53effe52af1ca9e44f67ff28"
+        CACHE STRING "Lib-QRCode commit checked out for the scan demo")
 set(HUXERUI_QRCODE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(HUXERUI_QRCODE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 huxerui_use_library(example_camera
         TARGET HuxerUI::QRCode
-        PATH "${HUXERUI_QRCODE_PATH}"
+        URL "${LIB_QRCODE_URL}"
+        COMMIT "${LIB_QRCODE_COMMIT}"
 )
 
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
