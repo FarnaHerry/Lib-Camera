@@ -323,7 +323,7 @@ The example opens in **PHOTO** and starts the preview automatically after camera
 
 Select **Camera**, **Screen**, or **Scan** above the capture controls to switch between camera capture, the transparent desktop aperture, and QR scanning.
 
-**Scan** keeps the live camera preview, captures preview frames periodically, and decodes the first QR code with `Lib-QRCode`. The decoded payload and **Scan again** appear below the viewfinder. Linux decodes camera JPEGs through gdk-pixbuf, Windows through WIC, Apple platforms through ImageIO, and Android through a `BitmapFactory` platform module; the decoded pixels are handed to `Lib-QRCode` in all cases. Scanning is unavailable on Web.
+**Scan** keeps the live camera preview, animates a top-to-bottom sweep line, and periodically captures frames for `Lib-QRCode`. A single decoded QR code opens a dedicated result page; when several codes share the frame, capture pauses and a chooser page lists them so you can open one. **Scan again** returns to the live scanner. Linux decodes camera JPEGs through gdk-pixbuf, Windows through WIC, Apple platforms through ImageIO, and Android through a `BitmapFactory` platform module; the decoded pixels are handed to `Lib-QRCode` in all cases. Scanning is unavailable on Web.
 
 The example fetches `Lib-QRCode` from its pinned upstream commit through `huxerui_use_library(URL, COMMIT)`; no local checkout is required. Override `LIB_QRCODE_COMMIT` or `LIB_QRCODE_URL` to test another revision. This is an example-only dependency; the Camera library itself does not link it.
 
