@@ -801,10 +801,7 @@ View PhotoReview(ImageAsset photo, BottomSheetContext sheet, TaskScope tasks, St
       .With(Frame{.max_height = 560.0F});
 }
 
-View ScanEffect() {
-  const Animated<Point> sweep = AnimateTo(
-      Point{0.0F, 220.0F}, TweenSpec{1.7, Easing::Linear},
-      AnimationPlayback{.iterations = std::nullopt, .repeat_mode = RepeatMode::Restart});
+View ScanEffect(float offset) {
   return Stack {
     Canvas([](PaintContext& paint, Size size) {
       constexpr float box = 240.0F;
@@ -829,18 +826,18 @@ View ScanEffect() {
     Stack {
       Canvas([](PaintContext& paint, Size size) {
         paint.DrawRect({0.0F, 0.0F, size.width, size.height}, accent);
-      }).With(Frame{.width = 220.0F, .height = 2.0F}, CornerRadius(1.0F)).With(Offset(sweep)),
+      }).With(Frame{.width = 220.0F, .height = 2.0F}, CornerRadius(1.0F)).With(Offset(Point{0.0F, offset})),
     }.With(Frame{.width = 240.0F, .height = 240.0F},
            Align(HorizontalAlignment::Center, VerticalAlignment::Start)),
   }.With(Grow(), Align(HorizontalAlignment::Center, VerticalAlignment::Center));
 }
 
-View ScanOverlay(State<ScanState> scan, bool live) {
+View ScanOverlay(State<ScanState> scan, bool live, float offset) {
   const char* status = !live ? "Camera is not running"
       : scan->error.empty() ? "Point the camera at a QR code"
       : "Scanning failed";
   return Stack {
-    live ? ScanEffect() : View(),
+    live ? ScanEffect(offset) : View(),
     Column {
       Spacer(),
       Label(status, 13.0F, foreground, FontWeight::SemiBold)
@@ -952,6 +949,7 @@ View CameraWorkspace() {
   auto active = UseState(false);
   auto mode = UseState(CaptureMode::Photo);
   auto scan = UseState(ScanState{});
+  auto scan_line = UseState(0.0F);
   auto scan_choices = UseState(std::vector<ScanCandidate>{});
   auto scan_result = UseState(std::optional<ScanCandidate>{});
   auto qr_decoder = UseState(QrDecoderHandle{});
@@ -1245,6 +1243,22 @@ View CameraWorkspace() {
     return [loop] { loop.Cancel(); };
   }, scanning, live, scan->generation);
 
+  Lifecycle([scanning, live, tasks, scan_line] {
+    TaskHandle animation;
+    if (scanning && live) {
+      animation = tasks.Launch([scan_line]() -> Task<void> {
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+          const auto elapsed =
+              std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+          scan_line = std::fmod(elapsed / 1.7F, 1.0F) * 220.0F;
+          co_await Delay(std::chrono::milliseconds(16));
+        }
+      });
+    }
+    return [animation] { animation.Cancel(); };
+  }, scanning, live);
+
   const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
   View badge = recording || phase == VideoPhase::Finishing
       ? RecordingBadge(session, recording && live, paused)
@@ -1365,7 +1379,7 @@ View CameraWorkspace() {
   if (scanning) {
     viewfinder = Stack {
       std::move(viewfinder),
-      ScanOverlay(scan, live),
+      ScanOverlay(scan, live, scan_line.Get()),
     }.With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch));
   }
 
