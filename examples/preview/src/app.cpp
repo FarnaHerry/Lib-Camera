@@ -839,7 +839,7 @@ View ScanOverlay(State<ScanState> scan, bool live, float offset) {
       : scan->error.empty() ? "Point the camera at a QR code"
       : "Scanning failed";
   return Stack {
-    live ? ScanEffect() : View(),
+    live ? ScanEffect(offset) : View(),
     Column {
       Spacer(),
       Label(status, 13.0F, foreground, FontWeight::SemiBold)
@@ -856,7 +856,6 @@ View ScanPanel(State<ScanState> scan, bool live, bool available, std::function<v
     Label(live ? "Scanning the live preview" : "Camera is not running", 14.0F, foreground, FontWeight::Medium),
     scan->error.empty() ? View() : Label(scan->error, 12.0F, Color::Rgb(255, 162, 156)),
     Row {
-      Label("QR codes are decoded locally with Lib-QRCode.", 12.0F, secondary),
       Spacer(),
       Button(live ? "Restart scan" : "Start camera")
           .OnClick([scan, live, retry = std::move(retry)] {
@@ -1266,6 +1265,22 @@ View CameraWorkspace() {
     }
     return [loop] { loop.Cancel(); };
   }, scan_mode, live, scan->generation);
+
+  Lifecycle([scan_mode, live, tasks, scan_line] {
+    TaskHandle animation;
+    if (scan_mode && live) {
+      animation = tasks.Launch([scan_line]() -> Task<void> {
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+          const auto elapsed =
+              std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+          scan_line = std::fmod(elapsed / 1.7F, 1.0F) * 220.0F;
+          co_await Delay(std::chrono::milliseconds(16));
+        }
+      });
+    }
+    return [animation] { animation.Cancel(); };
+  }, scan_mode, live);
 
   const Color status_color = status.state == camera::SessionState::Running ? accent : secondary;
   View badge = recording || phase == VideoPhase::Finishing
